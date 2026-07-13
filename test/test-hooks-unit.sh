@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Fast, hermetic unit tests for wt's session-hook contract (no ZFS/root/docker needed).
 #
-# The hooks are what keep `wt` generic. The motivating case: a per-sandbox compiler-cache server
-# (sccache) used to be wired straight into wt, and is now supplied by the consuming project as
-# WT_HOOK_ENTER / WT_HOOK_TEARDOWN. These tests pin that contract down so it can't creep back.
+# The hooks are what keep `wt` generic — every project-specific thing a sandbox needs (a build
+# cache, a language server, session env) arrives through WT_HOOK_ENTER / WT_HOOK_TEARDOWN and
+# nothing else. These tests pin that contract down so it can't quietly erode.
 #
-# `zfs` is stubbed on PATH and the hook is stubbed as a script that logs each call, so the
-# real `wt gc` code path runs for real. What is NOT hermetic: "teardown fires exactly once on
-# the LAST of N concurrent sessions" goes through `sudo unshare` + a real ZFS mount. We test
-# its two composable halves here (the name_active predicate, and run_teardown_hook); the full
-# multi-session path belongs to the ZFS end-to-end test-harness.sh.
+# `zfs` is stubbed on PATH and the hook is a script that logs each call, so the real `wt gc` code
+# path runs for real. What is NOT covered: "teardown fires exactly once on the LAST of N
+# concurrent sessions" needs `sudo unshare` and a real ZFS mount. Its two composable halves are
+# tested here (the name_active predicate, and run_teardown_hook); the multi-session path itself
+# needs a real pool.
 set -uo pipefail
 # Hermetic, and this is the sharp edge: wt resolves config as env > file > default. Setting
 # WT_CONFIG= keeps an installed /etc/wt/config out, but says nothing about the ENVIRONMENT — and
@@ -71,8 +71,8 @@ run_gc() {
     "$WT" gc >/dev/null 2>&1
 }
 
-# 1/2. gc fires teardown for the orphan clone, exactly once, with WT_SANDBOX set — and not for
-#      the live one. (Both assertions come from the same run: the log must be exactly one line.)
+# gc fires teardown for the orphan clone, once, with WT_SANDBOX set — and not for the live one.
+# Both assertions come from one run: the log must be exactly one line.
 setup_case
 run_gc; rc=$?
 log=$(cat "$TMP/hook.log")
@@ -88,16 +88,16 @@ log=$(cat "$TMP/hook.log")
 [ "$(cat "$TMP/zfs/destroyed")" = "tank/wt/orphan" ] \
   && ok "gc destroys only the orphan clone" || no "destroy list" "$(cat "$TMP/zfs/destroyed")"
 
-# 3. Best-effort contract: a hook that fails must not fail the wt operation.
+# Best-effort: a hook that fails must not fail the wt operation that called it.
 setup_case
 run_gc "false"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(cat "$TMP/zfs/destroyed")" = "tank/wt/orphan" ]; } \
   && ok "a failing teardown hook does not fail gc (best-effort), and gc still reclaims" \
   || no "failing hook broke gc" "rc=$rc destroyed=[$(cat "$TMP/zfs/destroyed")]"
 
-# 4/5. The last-exit decision, `name_active <n> || run_teardown_hook <n>` — the exact
-#      composition the EXIT trap in wt_enter uses. A marker is LIVE only while a process holds
-#      its flock (the file existing proves nothing: SIGKILL leaves it behind).
+# The last-exit decision, `name_active <n> || run_teardown_hook <n>` — the exact composition
+# wt_enter's EXIT trap uses. A marker is live only while a process holds its flock; the file
+# existing proves nothing, since SIGKILL leaves it behind.
 decide() {  # $1 = sandbox name; prints the hook log the decision produced
   PATH="$BIN:$PATH" HOOK_LOG="$TMP/hook.log" WT_HOME="$TMP/home" WT_CONFIG= \
   WT_HOOK_TEARDOWN="hook-log teardown" \
@@ -119,8 +119,8 @@ touch "$TMP/home/active/deadbox.1"                      # marker left by a SIGKI
 [ "$(decide deadbox)" = "deadbox teardown" ] \
   && ok "stale marker (no lock holder) -> teardown FIRES" || no "stale marker skipped teardown" "$(cat "$TMP/hook.log")"
 
-# 6/7. apply_hook_env — the enter hook's stdout becomes session env. Split at the FIRST '=' so
-#      values may contain '='; anything not a well-formed KEY=VALUE is ignored, not trusted.
+# apply_hook_env — the enter hook's stdout becomes session env. Split at the FIRST '=' so values
+# may contain '='; anything not a well-formed KEY=VALUE is ignored rather than trusted.
 env_out=$(bash -c '
   source "$1"
   apply_hook_env <<EOF
@@ -145,15 +145,15 @@ EOF
   && ok "apply_hook_env ignores blank/comment/malformed lines (no junk in env)" \
   || no "apply_hook_env leaked a malformed line" "$env_out"
 
-# 8/9/10. run_enter_hook's failure contract. This is the sharp edge. A hook typically hands the
-#   session a PER-SANDBOX daemon socket. If a missing hook were merely "best-effort", the session
-#   would start without it and fall back to whatever SHARED default the tool has — one daemon,
-#   living in one namespace, writing every sandbox's build outputs into the WRONG clone. So:
-#   a hook that RAN and failed still delivers its env; a hook that could not RUN aborts.
-# WT_DROP_PRIV= disables the setpriv drop: it needs CAP_SETUID even to drop to the uid we are
-# already at, so an unprivileged test cannot call it. The real setpriv path is covered by the
-# ZFS end-to-end harness, which runs as root.
-enter_hook() {  # $1 = WT_HOOK_ENTER; prints "rc=<n> UDS=<value>"
+# run_enter_hook's failure contract, the sharp edge. A hook typically hands the session a
+# PER-SANDBOX daemon socket. If a hook that couldn't run were merely "best-effort", the session
+# would start without it and fall back to the tool's SHARED default — one daemon, in one
+# namespace, writing every sandbox's build outputs into the WRONG clone. So: a hook that RAN and
+# failed still delivers its env; a hook that could not RUN aborts.
+#
+# WT_DROP_PRIV= disables the setpriv drop, which needs CAP_SETUID even to drop to the uid we are
+# already at — an unprivileged test cannot call it. The real setpriv path needs root.
+enter_hook() {  # $1 = WT_HOOK_ENTER; prints "rc=<n> SOCK=<value>"
   WT_DROP_PRIV= bash -c '
     source "$1"
     export WT_HOOK_ENTER="$2"
@@ -179,7 +179,7 @@ msg=$(WT_DROP_PRIV= bash -c 'source "$1"; export WT_HOOK_ENTER="/nonexistent/hoo
 [[ "$msg" == *"could not be executed"* ]] \
   && ok "the abort explains itself on stderr" || no "abort message" "$msg"
 
-# 11. No hook configured (the extracted-wt default) must be a clean no-op, not an error.
+# No hook configured at all — wt's default — must be a clean no-op, not an error.
 setup_case
 PATH="$BIN:$PATH" ZFS_STATE="$TMP/zfs" WT_HOME="$TMP/home" WT_CONFIG= \
 WT_CANONICAL="$TMP/canonical" WT_DS_SRC=tank/src WT_DS_PARENT=tank/wt WT_HOOK_TEARDOWN= \

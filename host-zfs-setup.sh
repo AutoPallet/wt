@@ -257,7 +257,7 @@ if ! zfs list -H -o name "$WT_DS_SRC" >/dev/null 2>&1 \
   fi
 fi
 
-# ---- 1. the source dataset ----------------------------------------------------------------
+# ---- the source dataset -------------------------------------------------------------------
 migrated=0
 if zfs list -H -o name "$WT_DS_SRC" >/dev/null 2>&1; then
   mp=$(zfs get -H -o value mountpoint "$WT_DS_SRC" 2>/dev/null || true)
@@ -291,14 +291,14 @@ else
   migrated=1
 fi
 
-# ---- 2. the never-snapshotted children ----------------------------------------------------
+# ---- the never-snapshotted children -------------------------------------------------------
 # Before any copying: a subpath's data must land IN its own dataset. Copy first and it lands in
 # the parent, where every snapshot would faithfully capture it.
 for sub in $WT_SNAPSHOT_EXCLUDE; do
   create_exclude_dataset "$sub"
 done
 
-# ---- 3. refill the checkout from the aside ------------------------------------------------
+# ---- refill the checkout from the aside ---------------------------------------------------
 if [ "$migrated" -eq 1 ]; then
   # Excluded subpaths first, each into its own (now mounted) dataset, verified exactly: this is
   # the data that exists in ONE place and is shared by every sandbox, so a silent short copy here
@@ -330,12 +330,12 @@ if [ "$migrated" -eq 1 ]; then
   fi
 fi
 
-# ---- 4. the clone parent ------------------------------------------------------------------
+# ---- the clone parent ---------------------------------------------------------------------
 # wt mounts each clone itself (mountpoint=legacy), so this dataset's own mountpoint matters only
 # as the host home of wt's state dir — bind it into the container as $WT_HOME.
 promote_dir_to_dataset "$WT_DIR" "$WT_DS_PARENT" -o xattr=sa -o acltype=posixacl
 
-# ---- 5. delegation ------------------------------------------------------------------------
+# ---- delegation ---------------------------------------------------------------------------
 # Permission sets are dataset-local, so define them on each dataset; both calls are idempotent.
 #
 # userprop is in the set because `wt new` stamps its provenance property ($WT_ZFS_PROP) at
@@ -357,7 +357,7 @@ zfs allow -l -d -u "$DELEGATE" @wt-ops "$WT_DS_SRC"
 zfs allow -l -d -u "$DELEGATE" @wt-ops,@wt-props "$WT_DS_PARENT"
 log "delegated snapshot/clone/destroy/mount/... to $DELEGATE (uid $WT_TARGET_UID)"
 
-# ---- 6. probe -----------------------------------------------------------------------------
+# ---- probe --------------------------------------------------------------------------------
 # Prove the delegation actually works for that identity, doing exactly what `wt new` does —
 # including the $WT_ZFS_PROP stamp, whose permission (userprop) is easy to get wrong and whose
 # absence would only surface later, as snapshots gc refuses to reap. `#<uid>` rather than a name:
@@ -375,14 +375,14 @@ fi
 # ---- done ---------------------------------------------------------------------------------
 log ""
 log "Host setup complete. Next:"
-log "  1. Make $WT_DIR reachable in the container as \$WT_HOME, and $CHECKOUT_DIR as \$WT_CANONICAL"
-log "     (bind mounts); rebuild/reopen the devcontainer so the new dataset is the bind source."
-log "  2. Install wt in the container (see install.sh) and check 'wt status'."
+log "  * Make $WT_DIR reachable in the container as \$WT_HOME, and $CHECKOUT_DIR as \$WT_CANONICAL"
+log "    (bind mounts), then restart the container so the new dataset is the bind source."
+log "  * Install wt in the container (see install.sh) and check 'wt status'."
 if [ "$migrated" -eq 1 ]; then
-  log "  3. Verify $CHECKOUT_DIR looks right (git status; build it), then reclaim the copy:"
+  log "  * Verify $CHECKOUT_DIR looks right (git status; build it), then reclaim the copy:"
   log "       rm -rf $ASIDE_DIR"
   log ""
-  log "Rollback — only before that rm, and only if step 2 shows a problem:"
+  log "Rollback — only before that rm, and only if something looks wrong:"
   log "  zfs destroy -r $WT_DS_SRC        # cascades to the never-snapshotted children"
   log "  mv $ASIDE_DIR $CHECKOUT_DIR"
 fi

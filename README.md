@@ -8,10 +8,10 @@ clone of the tree you were just working in. Break it, `wt rm foo`, and it is gon
 checkout was never touched.
 
 ```
-wt new   <name> [ref]         snapshot+clone your tree, register a git worktree
+wt new   <name> [ref]         snapshot+clone your current tree (uncommitted changes and all)
 wt enter <name> [-- cmd...]   enter the sandbox (default: bash)
 wt list                       sandboxes + how many bytes each clone actually costs
-wt rm    <name>               worktree+branch removed, clone+snapshot destroyed
+wt rm    <name>               clone+snapshot destroyed; the branch is archived, not deleted
 wt gc                         reclaim orphans whose sandbox is gone
 wt status                     config + dataset state
 ```
@@ -37,7 +37,7 @@ consistent. An mtime-based build system (cargo, make, ninja) therefore sees a fu
 and rebuilds exactly what you edit — no content-hashing flag, no mtime-aging hack, no path
 remapping.
 
-`zfs snapshot` + `zfs clone` are O(milliseconds) and copy-on-write, so a sandbox is
+`zfs snapshot` and `zfs clone` take milliseconds and are copy-on-write, so a sandbox is
 near-instant to create and costs only what it diverges by. `wt list` shows you that number.
 
 ## It knows nothing about your project
@@ -81,19 +81,31 @@ WT_HOOK_TEARDOWN='/opt/myrepo/wt-hook teardown'
 
 ## Requirements
 
-**ZFS.** Not an implementation detail to be abstracted away later — O(ms) CoW snapshots *are*
-the tool. Also: Linux (mount namespaces), `sudo` for the mount (the ZFS module rejects
-delegated mounts from a non-init userns, so a userns alone will not do), and git ≥ 2.5.
+**ZFS.** Not an implementation detail to be abstracted away later — millisecond copy-on-write
+snapshots *are* the tool. Also: Linux (mount namespaces), `sudo` for the mount (the ZFS module
+rejects delegated mounts from a non-init userns, so a userns alone will not do), and git ≥ 2.5.
 
 ## Editor over SSH, with no listening port
 
-`wt-ssh` (optional, host-side) hands your editor an SSH session *into* a sandbox over
-`docker exec` — inetd-mode `sshd -i` on a pipe, no port bound anywhere.
+`wt-ssh` runs on your machine, not in the container, and hands your editor an SSH session
+*into* a sandbox over `docker exec` — inetd-mode `sshd -i` on a pipe, no port bound anywhere.
 
 ```sh
 wt-ssh config >> ~/.ssh/config    # one `Host wt-<name>` per sandbox
 ssh wt-foo                        # or point VS Code / JetBrains at it
 ```
+
+## Two things wt refuses to do
+
+**Destroy a snapshot it didn't create.** `wt gc` reaps only snapshots stamped with its ZFS
+property (`WT_ZFS_PROP`); a name glob is not provenance. Your hand-made `@wt-backup` gets
+listed for you to reap by hand, never destroyed automatically.
+
+**Believe a marker file.** A session counts as live only while it holds an `flock`. The exit
+trap never runs on SIGKILL, so a leftover marker proves nothing — but the lock dies with the
+process no matter how the process dies, which is the only signal that cannot lie. `wt rm`
+therefore can't be fooled into destroying a clone that something is still using, or blocked
+forever by a sandbox that was OOM-killed a week ago.
 
 ## Tests
 
@@ -111,17 +123,3 @@ need no pool, no root and no container, and they run in seconds. CI gates on eve
 (does a mount namespace outlive its creator? does `flock` behave under contention? will `sshd -i`
 serve a session over a pipe?). They need a real host; they are kept because the answers are
 easier to re-derive by running them than by arguing.
-
-## Notes on things that look like bugs but aren't
-
-- **`wt new` warns if main is dirty.** The snapshot captures your *working tree*, so the
-  sandbox inherits uncommitted changes as its own diff. Sometimes useful, sometimes
-  surprising; it says so out loud rather than picking for you.
-- **`wt rm` archives the branch** (`wt/<name>` → `wt-archive/<name>`) instead of deleting it.
-  Sandboxes are throwaway; the work in them might not be.
-- **A session is live only while it holds an `flock`.** A marker file's existence proves
-  nothing — the exit trap never runs on SIGKILL. The lock dies with the process no matter how
-  it dies, which is the only signal that cannot lie.
-- **`wt gc` only reaps snapshots carrying its ZFS property** (`WT_ZFS_PROP`). A name glob is
-  not provenance: your hand-made `@wt-backup` is listed for you to reap by hand, never
-  destroyed automatically.

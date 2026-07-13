@@ -1,20 +1,20 @@
 #!/bin/bash
-# In-namespace setup for `wt enter`. Runs as REAL ROOT (uid 0 in the container's initial
-# userns) inside a new mountns from `sudo unshare --mount --propagation private`. Mounting the
-# per-sandbox ZFS clone requires real CAP_SYS_ADMIN — userns CAP_SYS_ADMIN is NOT enough (the
-# ZFS module rejects delegated dataset mounts from a non-init userns). After the mounts, drops
-# to the target uid via setpriv and execs the command. The sudo'd mountns is torn down with
-# this process tree, so the ZFS mount auto-cleans on exit (no umount needed).
+# In-namespace setup for `wt enter`. Runs as REAL ROOT (uid 0 in the container's initial userns)
+# inside a fresh mount namespace from `sudo unshare --mount --propagation private`. Mounting the
+# per-sandbox ZFS clone needs real CAP_SYS_ADMIN — userns CAP_SYS_ADMIN is not enough, the ZFS
+# module rejects delegated mounts from a non-init userns. Once the mounts are up it drops to the
+# target uid and execs the command. The mount namespace dies with this process tree, so the ZFS
+# mount cleans itself up on exit; nothing to umount.
 #
-# Knows nothing about any project, language or toolchain: everything project-specific arrives
-# as WT_* env from `wt`, or is done by the session enter-hook.
+# Knows nothing about any project, language or toolchain. Everything project-specific arrives as
+# WT_* env from `wt`, or is done by the enter hook.
 set -euo pipefail
 
-# Export the KEY=VALUE lines a session enter-hook printed on stdout (direnv-style) into this
-# process's env, so they reach the command we exec below. The key is split at the FIRST '=',
-# so a value may itself contain '='. Assignment is direct and never eval'd — a hook cannot
-# inject shell here. Anything that isn't a well-formed KEY=VALUE (blank lines, comments,
-# stray chatter the hook forgot to redirect) is ignored rather than trusted.
+# Export the KEY=VALUE lines an enter hook printed on stdout (direnv-style) into this process,
+# so they reach the command exec'd below. Split at the FIRST '=', so a value may contain '='.
+# Assignment is direct, never eval'd: a hook cannot inject shell here. Anything that isn't a
+# well-formed KEY=VALUE — blank lines, comments, chatter the hook forgot to redirect — is
+# ignored rather than trusted.
 apply_hook_env() {
   local kv
   while IFS= read -r kv; do
@@ -23,33 +23,32 @@ apply_hook_env() {
   done
 }
 
-# The privilege drop, as one overridable command. setpriv needs CAP_SETUID even to "drop" to
-# the uid it is already at, so an unprivileged unit test cannot call it and substitutes a
-# no-op (WT_DROP_PRIV=). Real setuid, not a nested userns: a userns would shadow every host
-# uid not explicitly mapped, so files owned by other users would show up as nobody (65534) and
-# git/build tools would reject them with dubious-ownership / permission-denied.
+# The privilege drop, as one overridable command. setpriv needs CAP_SETUID even to "drop" to the
+# uid it is already at, so an unprivileged unit test cannot call it and substitutes a no-op
+# (WT_DROP_PRIV=). Real setuid, not a nested userns: a userns would shadow every host uid it
+# didn't map, so files owned by other users would appear as nobody (65534) and git and build
+# tools would reject them with dubious-ownership or permission-denied.
 WT_TARGET_UID=${WT_TARGET_UID:-$(id -u)}
 WT_TARGET_GID=${WT_TARGET_GID:-$(id -g)}
 WT_DROP_PRIV=${WT_DROP_PRIV-setpriv --reuid=$WT_TARGET_UID --regid=$WT_TARGET_GID --init-groups --inh-caps=-all --}
 
-# Run the session enter-hook as the target user, in THIS namespace, and fold its emitted env
-# into ours. wt knows nothing about what the hook starts.
+# Run the enter hook as the target user, in THIS namespace, and fold its emitted env into ours.
+# wt has no idea what the hook starts.
 #
 # "Best-effort" is scoped deliberately, because getting it wrong is silently destructive:
 #
-#   ran, then failed   -> CONTINUE. It may have set up partially, and whatever env it managed
-#                         to emit is still applied (a well-written hook prints its env FIRST,
-#                         before the parts that can fail).
-#   could not RUN      -> ABORT, loudly. 127/126 means the session would silently inherit NONE
-#     (127/126)           of what the hook guarantees — for a hook that hands out a per-sandbox
-#                         daemon socket, the session would quietly fall back to a SHARED one and
-#                         write this sandbox's build outputs into another sandbox's clone. A
-#                         missing hook is a config error, not a runtime hiccup, and a hard error
-#                         beats corrupt artifacts.
+#   ran, then failed   -> CONTINUE. It may have set up part of what it promised, and whatever env
+#                         it managed to print still applies. (A well-written hook prints its env
+#                         FIRST, before anything that can fail.)
+#   could not RUN      -> ABORT, loudly. The session would inherit NONE of what the hook
+#     (126/127)           guarantees. For a hook handing out a per-sandbox daemon socket, that
+#                         means quietly falling back to a SHARED one — and writing this sandbox's
+#                         build outputs into another sandbox's clone. A missing hook is a config
+#                         error, not a runtime hiccup, and a hard error beats corrupt artifacts.
 run_enter_hook() {
   [ -n "${WT_HOOK_ENTER:-}" ] || return 0
   local out rc=0
-  # shellcheck disable=SC2086  # deliberate word-split: WT_DROP_PRIV is a command + its args
+  # shellcheck disable=SC2086  # deliberate word-split: WT_DROP_PRIV is a command plus its args
   out=$($WT_DROP_PRIV bash -c "$WT_HOOK_ENTER" 2>/dev/null) || rc=$?
   if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
     echo "wt: enter hook could not be executed: $WT_HOOK_ENTER" >&2
@@ -58,31 +57,29 @@ run_enter_hook() {
     exit 1
   fi
   [ "$rc" -eq 0 ] || echo "wt: enter hook failed (rc=$rc); continuing with the env it emitted" >&2
-  # Here-string, NOT a pipe: a pipe would run apply_hook_env in a subshell and its exports
-  # would die with it, silently losing the hook's env.
+  # Here-string, NOT a pipe: a pipe runs apply_hook_env in a subshell, whose exports die with it.
   apply_hook_env <<<"$out"
 }
 
-# Sourcing this file (test/test-hooks-unit.sh) defines the helpers above without running any
-# of the mount/privilege work below.
+# Sourcing this file (test/test-hooks-unit.sh) defines the helpers above and runs none of the
+# mount or privilege work below.
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 name="$1"; shift
 [ "${1:-}" = -- ] && shift
 
-# sudo's secure_path strips PATH down to system dirs even under -E, which would hide the
-# caller's toolchains from the dropped-to-target process. `wt` stashes the real PATH in
-# WT_PATH (which sudo does preserve) purely so we can put it back — wt itself has no idea
-# what is on it.
+# sudo's secure_path strips PATH to system dirs even under -E, hiding the caller's toolchains
+# from the process we drop to. `wt` stashes the real PATH in WT_PATH (which sudo does preserve)
+# purely so we can put it back. wt has no idea what is on it.
 export PATH="${WT_PATH:-$PATH}"
 
-# All inputs arrive via WT_* env exported by `wt` (preserved through `sudo -E`).
+# Every input arrives as WT_* env from `wt`, through `sudo -E`.
 : "${WT_CANONICAL:?}" "${WT_SRC_CLONE:?}" "${WT_META:?}"
 : "${WT_GIT_HOLD:?}" "${WT_GIT_REAL:?}" "${WT_HOLD_DIR:?}"
 
-# 1. Pre-shadow binds. Paths still resolve to main's host view here (the clone is not yet
-#    mounted over $WT_CANONICAL). After step 2 these binds keep main's live .git and its
-#    never-snapshotted subpaths reachable inside the namespace, via the hold paths.
+# Pre-shadow binds, while paths still resolve to main's host view — the clone is not mounted yet.
+# Once it is, these hold paths are what keep main's live .git and the never-snapshotted subpaths
+# reachable from inside the namespace.
 mount --bind "$WT_GIT_REAL" "$WT_GIT_HOLD"
 for sub in ${WT_SNAPSHOT_EXCLUDE:-}; do
   hold="$WT_HOLD_DIR/${sub//\//_}"          # keep this key in sync with wt's exclude_key()
@@ -90,49 +87,45 @@ for sub in ${WT_SNAPSHOT_EXCLUDE:-}; do
   mount --bind "$WT_CANONICAL/$sub" "$hold"
 done
 
-# 2. Mount the per-sandbox ZFS clone over the canonical path. Real CAP_SYS_ADMIN required (we
-#    have it as sudo'd root); private propagation keeps this invisible outside the mountns.
-#    The clone is read-write (CoW from its origin snapshot), so every sandbox write — source
-#    edits AND build outputs — lands in the clone, and main is untouched.
+# The clone, over the canonical path. This is the whole trick: same path, so absolute paths in
+# build artifacts still resolve. Private propagation keeps it invisible outside this namespace.
+# The clone is read-write (CoW from its origin snapshot), so every sandbox write — source edits
+# and build outputs alike — lands in the clone, and main is untouched.
 mount -t zfs "$WT_SRC_CLONE" "$WT_CANONICAL"
 
-# 3. Restore each excluded subpath to main's live view. In the clone these are just empty
-#    child-dataset mountpoint dirs (the children are never snapshotted, so none of their data
-#    is in the clone). Every sandbox therefore shares ONE real copy, on the host.
+# Restore the excluded subpaths to main's live view. Inside the clone they are empty
+# child-dataset mountpoints — the children were never snapshotted, so none of their data is
+# there. Binding the canonical copy back over them gives every sandbox ONE shared live copy.
 for sub in ${WT_SNAPSHOT_EXCLUDE:-}; do
   mount --bind "$WT_HOLD_DIR/${sub//\//_}" "$WT_CANONICAL/$sub"
 done
 
-# 4. Replace the snapshot-frozen .git directory with the worktree pointer file, so git in the
-#    sandbox resolves through main's LIVE .git (via the WT_GIT_HOLD bind in step 1). Done
-#    in-place inside the clone — this destroys the clone's frozen .git/ copy, but CoW means
-#    the snapshot still references those blocks, so the storage cost stays at the snapshot,
-#    not the clone. Idempotent across re-entry: after the first enter, $WT_CANONICAL/.git is
-#    already the pointer file and the rm is a no-op. Chown so the target user owns the pointer
-#    after the privilege drop, or git refuses with "dubious ownership in repository".
+# Swap the clone's snapshot-frozen .git directory for the worktree pointer file, so git in the
+# sandbox resolves through main's LIVE .git (bound at WT_GIT_HOLD above). The rm destroys the
+# clone's frozen copy, but CoW means the snapshot still holds those blocks — the storage cost
+# stays with the snapshot. Idempotent on re-entry: .git is already the pointer file by then.
+# Chown it, or git refuses the target user with "dubious ownership in repository".
 if [ -d "$WT_CANONICAL/.git" ]; then
   rm -rf "$WT_CANONICAL/.git"
 fi
 cp -f "$WT_META/dot_git" "$WT_CANONICAL/.git"
 chown "$WT_TARGET_UID:$WT_TARGET_GID" "$WT_CANONICAL/.git"
 
-# 5. Override the per-worktree gitdir back-pointer (private propagation keeps the host's real
-#    .git untouched). main's .git/worktrees/$name/gitdir was written by `wt new`'s `git
-#    worktree add` with the host-side placeholder path ($WT_HOME/trees/<name>/.git), but
-#    inside the sandbox the worktree IS $WT_CANONICAL — so override the in-NS view to match.
+# `wt new`'s `git worktree add` wrote the gitdir back-pointer with the host-side placeholder path
+# ($WT_HOME/trees/<name>/.git), but inside the sandbox the worktree IS $WT_CANONICAL. Override
+# the in-namespace view to match; private propagation keeps the host's real .git untouched.
 mount --bind "$WT_META/gitdir_backptr" "$WT_GIT_HOLD/worktrees/$name/gitdir"
 
 cd "$WT_CANONICAL"
 
-# 6. First-enter checkout of a non-HEAD ref. `wt new <name> <ref>` clones main's CURRENT tree
-#    (so build outputs stay warm) but points the branch HEAD at <ref>, so the clone holds
-#    main's files, not <ref>'s. Materialize <ref> into the writable clone here, where it is
-#    mounted, with minimal CoW writes: seed the index from the clone's actual baseline
-#    (WT_SRC_COMMIT), refresh stat info, then a two-tree read-tree writes only the files that
-#    differ (falling back to a hard reset if local state conflicts). Run as the target user so
-#    the written files and index are theirs. A host-side sentinel makes this once-only, so
-#    re-entry preserves the sandbox's working state. Skipped for the common current-state
-#    clone (WT_REF_SHA == WT_SRC_COMMIT), where `wt new` already seeded the index.
+# First-enter checkout of a non-HEAD ref. `wt new <name> <ref>` clones main's CURRENT tree (that
+# is what keeps the build warm) but points the branch at <ref> — so the clone holds main's files,
+# not <ref>'s. Materialize <ref> here, where the clone is mounted and writable, with as few CoW
+# writes as possible: seed the index from the clone's actual baseline (WT_SRC_COMMIT), refresh
+# stat info, then let a two-tree read-tree write only the files that differ (falling back to a
+# hard reset if local state conflicts). As the target user, so the files and index are theirs.
+# A host-side sentinel makes it once-only, so re-entry preserves the sandbox's working state.
+# Skipped for the common case (WT_REF_SHA == WT_SRC_COMMIT), where `wt new` seeded the index.
 if [ -n "${WT_REF_SHA:-}" ] && [ -n "${WT_SRC_COMMIT:-}" ] \
    && [ "$WT_REF_SHA" != "$WT_SRC_COMMIT" ] && [ ! -e "$WT_META/materialized" ]; then
   # shellcheck disable=SC2086
@@ -151,11 +144,10 @@ if [ -n "${WT_REF_SHA:-}" ] && [ -n "${WT_SRC_COMMIT:-}" ] \
   fi
 fi
 
-# 7. Fire the session enter-hook (as the target user, in THIS namespace) and export whatever
-#    env it emits, BEFORE handing off. Done explicitly here rather than from a shell rc file
-#    so it also covers a directly-exec'd command (`wt enter x -- cmd`, `wt claude`).
+# Fire the enter hook and export what it emits, before handing off. Done here rather than from a
+# shell rc file so it also covers a directly-exec'd command (`wt enter x -- cmd`), which never
+# sources one.
 run_enter_hook
 
-# 8. Drop privileges and hand off.
 # shellcheck disable=SC2086
 exec $WT_DROP_PRIV "$@"

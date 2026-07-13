@@ -132,8 +132,8 @@ WT_DS_PARENT=rpool/data/myrepo-wt
 #     esac
 #
 # Defaults: both empty (no hooks).
-#WT_HOOK_ENTER='/workspaces/myrepo/.devcontainer/wt-hook enter'
-#WT_HOOK_TEARDOWN='/workspaces/myrepo/.devcontainer/wt-hook teardown'
+#WT_HOOK_ENTER='/workspaces/myrepo/tools/wt-hook enter'
+#WT_HOOK_TEARDOWN='/workspaces/myrepo/tools/wt-hook teardown'
 
 # ---- optional ssh transport (only if you use wt-ssh) --------------------------------------
 # `wt-ssh` runs on your LOCAL machine and proxies an ssh session into a sandbox over
@@ -151,7 +151,7 @@ WT_DS_PARENT=rpool/data/myrepo-wt
 # Path to wt-ssh on your LOCAL machine, relative to the checkout — baked into the ProxyCommand
 # lines that `wt ssh-config` prints for your ~/.ssh/config.
 # Default: .wt/wt-ssh
-#WT_SSH_PROXY=.devcontainer/worktree/wt-ssh
+#WT_SSH_PROXY=tools/wt-ssh
 
 # Where wt is installed INSIDE the container (see install.sh). Used as the sshd ForceCommand and
 # by wt-ssh's `docker exec`.

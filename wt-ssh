@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # wt-ssh <verb> — optional HOST-side entrypoint for `wt` sandboxes. Run this on the machine
-# with `docker` access to the devcontainer (your laptop). For sandbox commands
-# (new/enter/claude/rm/…), run `wt` INSIDE the container — this tool only proxies the
-# SSH-related bits in over docker exec.
+# with `docker` access to the container (your laptop). For sandbox commands (new/enter/rm/…)
+# run `wt` INSIDE the container; this tool only proxies the SSH-related ones in over docker exec.
 #
 # It resolves THIS checkout's devcontainer by the bind mount whose destination is $WT_CANONICAL
 # (launcher-agnostic — unlike the VS-Code-only devcontainer.local_folder label), then runs the
@@ -58,7 +57,7 @@ usage: wt-ssh <config | list | proxy <name>>   (run on the host; needs docker)
   config         print ~/.ssh/config blocks for this checkout's sandboxes, to paste locally
   list           list this checkout's sandboxes
   proxy <name>   SSH ProxyCommand transport (invoked by generated ~/.ssh/config, not by hand)
-For sandbox commands (new/enter/claude/rm/…), run \`wt\` inside the container.
+For sandbox commands (new/enter/rm/…), run \`wt\` inside the container.
 EOF
   exit 2
 }
