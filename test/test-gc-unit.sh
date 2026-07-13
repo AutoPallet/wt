@@ -9,6 +9,13 @@
 # Nothing here can touch real state: zfs is a stub, every path is overridden, WT_CONFIG= skips
 # any installed config file, and WT_HOOK_TEARDOWN= disarms the teardown hook.
 set -uo pipefail
+# Hermetic, and this is the sharp edge: wt resolves config as env > file > default. Setting
+# WT_CONFIG= keeps an installed /etc/wt/config out, but says nothing about the ENVIRONMENT — and
+# every `wt enter` exports a WT_* bundle, so running this suite inside a sandbox would quietly
+# feed the code under test that sandbox's real config. It passed for the wrong reason. Scrub the
+# inherited namespace first; everything the tests depend on is set explicitly below.
+while IFS= read -r _v; do unset "$_v"; done < <(compgen -v | grep '^WT_' || true)
+
 DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 WT="$DIR/../wt"
 PASS=0; FAIL=0
@@ -68,7 +75,8 @@ chmod +x "$T/bin/zfs"
 
 wt() {
   env PATH="$T/bin:$PATH" WT_CONFIG= WT_HOOK_TEARDOWN= \
-      WT_HOME="$T/home" WT_DS_SRC="$DS_SRC" WT_DS_PARENT="$DS_PARENT" WT_ZFS_PROP="$PROP" \
+      WT_HOME="$T/home" WT_CANONICAL="$T/canonical" \
+      WT_DS_SRC="$DS_SRC" WT_DS_PARENT="$DS_PARENT" WT_ZFS_PROP="$PROP" \
       bash "$WT" "$@"
 }
 

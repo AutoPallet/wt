@@ -11,6 +11,13 @@
 # its two composable halves here (the name_active predicate, and run_teardown_hook); the full
 # multi-session path belongs to the ZFS end-to-end test-harness.sh.
 set -uo pipefail
+# Hermetic, and this is the sharp edge: wt resolves config as env > file > default. Setting
+# WT_CONFIG= keeps an installed /etc/wt/config out, but says nothing about the ENVIRONMENT — and
+# every `wt enter` exports a WT_* bundle, so running this suite inside a sandbox would quietly
+# feed the code under test that sandbox's real config. It passed for the wrong reason. Scrub the
+# inherited namespace first; everything the tests depend on is set explicitly below.
+while IFS= read -r _v; do unset "$_v"; done < <(compgen -v | grep '^WT_' || true)
+
 DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 WT="$DIR/../wt"
 SETUP="$DIR/../wt-setup.sh"
@@ -59,7 +66,7 @@ setup_case() {
 # and change these answers.
 run_gc() {
   PATH="$BIN:$PATH" ZFS_STATE="$TMP/zfs" HOOK_LOG="$TMP/hook.log" WT_CONFIG= \
-  WT_HOME="$TMP/home" WT_DS_SRC=tank/src WT_DS_PARENT=tank/wt \
+  WT_HOME="$TMP/home" WT_CANONICAL="$TMP/canonical" WT_DS_SRC=tank/src WT_DS_PARENT=tank/wt \
   WT_HOOK_TEARDOWN="${1:-hook-log teardown}" \
     "$WT" gc >/dev/null 2>&1
 }
@@ -175,7 +182,7 @@ msg=$(WT_DROP_PRIV= bash -c 'source "$1"; export WT_HOOK_ENTER="/nonexistent/hoo
 # 11. No hook configured (the extracted-wt default) must be a clean no-op, not an error.
 setup_case
 PATH="$BIN:$PATH" ZFS_STATE="$TMP/zfs" WT_HOME="$TMP/home" WT_CONFIG= \
-WT_DS_SRC=tank/src WT_DS_PARENT=tank/wt WT_HOOK_TEARDOWN= \
+WT_CANONICAL="$TMP/canonical" WT_DS_SRC=tank/src WT_DS_PARENT=tank/wt WT_HOOK_TEARDOWN= \
   "$WT" gc >/dev/null 2>&1; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(cat "$TMP/zfs/destroyed")" = "tank/wt/orphan" ]; } \
   && ok "no teardown hook configured -> gc still works (hooks are optional)" \

@@ -9,6 +9,13 @@
 # its marker behind. If a stale marker read as live, that sandbox could never be removed again;
 # if a live one read as stale, `wt rm` would yank the clone out from under a running session.
 set -uo pipefail
+# Hermetic, and this is the sharp edge: wt resolves config as env > file > default. Setting
+# WT_CONFIG= keeps an installed /etc/wt/config out, but says nothing about the ENVIRONMENT — and
+# every `wt enter` exports a WT_* bundle, so running this suite inside a sandbox would quietly
+# feed the code under test that sandbox's real config. It passed for the wrong reason. Scrub the
+# inherited namespace first; everything the tests depend on is set explicitly below.
+while IFS= read -r _v; do unset "$_v"; done < <(compgen -v | grep '^WT_' || true)
+
 DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 WT="$DIR/../wt"
 PASS=0; FAIL=0
