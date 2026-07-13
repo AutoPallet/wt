@@ -27,9 +27,17 @@
 #     dataset must be mounted where the HOST sees the checkout (~/src/myrepo). When those
 #     differ — they usually do — pass the host path as the first argument.
 #
-# Safe to re-run: every step is skipped if its dataset already exists. The migration never
-# deletes anything; the pre-migration checkout is left at <checkout>.aside and the script prints
-# the command to reclaim it once you are satisfied.
+# Safe to re-run: every step is skipped if its dataset already exists.
+#
+# It checks the WHOLE plan before it does any of it, prints the plan, and asks once. This is the
+# script that moves somebody's only checkout, and the worst way to fail is halfway — so a
+# precondition that would break step three is found before step one runs.
+#
+# Every step that moves data is a single rename(2) — the directory either moved or it did not,
+# there is no half-moved state — followed by a copy INTO the new dataset. If the create fails, the
+# rename is undone. Nothing is ever deleted: the pre-migration copy is left at <dir>.aside.<pid>
+# (and the checkout's at <checkout>.aside), and the script prints the command to reclaim it once
+# you have looked.
 #
 # Usage: host-zfs-setup.sh [CHECKOUT_DIR [WT_DIR]] [-y]
 #   CHECKOUT_DIR   host mountpoint for $WT_DS_SRC       (default: $WT_CANONICAL from config)
@@ -179,47 +187,49 @@ mount_owner_of() {
   return 0
 }
 
-# Turn an existing plain directory into the mountpoint of a NEW dataset without losing what is
-# in it: stage the content in a sibling temp dir (same filesystem, so that first move is a
-# rename, not a copy), create the dataset over the now-empty path, move the content back in.
-# Idempotent — an existing dataset is left exactly as it is.
-promote_dir_to_dataset() {
-  local dir=$1 ds=$2; shift 2
-  if zfs list -H -o name "$ds" >/dev/null 2>&1; then
-    log "$ds already exists; skipping create"
-    return 0
+# Is $1 a mountpoint of ANY filesystem? mount_owner_of only sees ZFS, and that blind spot used to
+# be destructive: an ext4 or bind mountpoint would pass its check, we would empty the directory,
+# and then rmdir would fail EBUSY — leaving the checkout empty and the diagnostic pointing at the
+# wrong thing. A directory you cannot rmdir is a directory you must not start emptying.
+is_mountpoint() {
+  local d=$1 real
+  [ -d "$d" ] || return 1
+  real=$(realpath -s -- "$d" 2>/dev/null) || return 1
+  if command -v findmnt >/dev/null 2>&1; then
+    [ "$(findmnt -rn --target "$real" -o TARGET 2>/dev/null | head -1)" = "$real" ]
+  else
+    mountpoint -q -- "$real" 2>/dev/null
   fi
-  # Some OTHER dataset already owns this path — moving its contents around would be vandalism.
-  local owner
-  owner=$(mount_owner_of "$dir")
-  if [ -n "$owner" ]; then
-    die "$dir is already the mountpoint of $owner; refusing to promote it to $ds"
-  fi
-
-  local staged=""
-  if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
-    staged=$(mktemp -d "$dir.aside.XXXXXX")
-    log "$dir has content; staging it in $staged while $ds is created"
-    # dotglob, because .git/.cargo/... must come along; the classic `.??*` glob also silently
-    # misses two-character dotfiles.
-    ( shopt -s dotglob; mv -- "$dir"/* "$staged"/ )
-    [ -z "$(ls -A "$dir" 2>/dev/null)" ] || die "could not empty $dir (its content is in $staged)"
-  fi
-  if [ -d "$dir" ]; then
-    rmdir "$dir" || die "could not rmdir $dir (still has content?)"
-  fi
-
-  zfs create "$@" -o mountpoint="$dir" "$ds"
-  chown "$WT_TARGET_UID:$WT_TARGET_GID" "$dir"
-  if [ -n "$staged" ]; then
-    ( shopt -s dotglob; mv -- "$staged"/* "$dir"/ )
-    rmdir "$staged" 2>/dev/null || log "warning: $staged is not empty after the restore — check it by hand"
-  fi
-  log "created $ds mounted at $dir"
+}
+what_is_mounted_at() {
+  findmnt -rn --target "$1" -o SOURCE,FSTYPE 2>/dev/null | head -1 || true
 }
 
-# Each WT_SNAPSHOT_EXCLUDE entry becomes $WT_DS_SRC/<sub>, mounted at <checkout>/<sub>.
-create_exclude_dataset() {
+# Everything that must be TRUE before we touch a directory we are about to turn into a dataset.
+# Called for every planned promotion during preflight, so the script can refuse while the world is
+# still exactly as the user left it.
+check_promotable() {
+  local dir=$1 ds=$2 owner
+  zfs list -H -o name "$ds" >/dev/null 2>&1 && return 0   # already a dataset: nothing to do
+  [ -e "$dir" ] || return 0                               # nothing there: a plain create
+  [ -d "$dir" ] || die "$dir exists but is not a directory"
+
+  owner=$(mount_owner_of "$dir")
+  [ -z "$owner" ] \
+    || die "$dir is already the mountpoint of $owner; refusing to promote it to $ds"
+  ! is_mountpoint "$dir" \
+    || die "$dir is a mountpoint ($(what_is_mounted_at "$dir")), not a plain directory.
+    It cannot be replaced by a dataset while something is mounted there. Unmount it first, or
+    point this dataset somewhere else."
+  [ -w "$(dirname -- "$dir")" ] \
+    || die "$(dirname -- "$dir") is not writable — cannot rename $dir aside to make room for $ds"
+  [ ! -e "$dir.aside.$$" ] || die "$dir.aside.$$ already exists; move it away first"
+}
+
+# Shape and feasibility of one WT_SNAPSHOT_EXCLUDE entry. Pure checks — run in preflight, before
+# anything is created, because a bad entry discovered halfway through leaves a half-provisioned
+# source dataset behind.
+check_exclude_entry() {
   local sub=$1 ds parent_ds
   case "$sub" in
     /*|*/|*//*|*..*) die "WT_SNAPSHOT_EXCLUDE entry '$sub' must be a plain relative subpath (no leading/trailing slash, no ..)" ;;
@@ -237,8 +247,57 @@ create_exclude_dataset() {
     everything under it — not just $sub — would vanish from every sandbox. Exclude the top-level
     directory instead, or create $parent_ds yourself if that really is what you want."
   fi
-  promote_dir_to_dataset "$CHECKOUT_DIR/$sub" "$ds"
 }
+
+# Turn an existing plain directory into the mountpoint of a NEW dataset without losing what is in
+# it. Preconditions were established in preflight; this only acts.
+#
+# The directory is RENAMED aside in a single rename(2) — it either moved or it didn't, so there is
+# no state where half the content is in one place and half in the other. Then the dataset is
+# created over the now-free path and the content is copied in. If the create fails, the rename is
+# undone and the world is as it was.
+#
+# The aside copy is NOT deleted. It is the rollback, and reclaiming it is a decision the user
+# makes once they have looked — not one this script makes for them while they are not watching.
+promote_dir_to_dataset() {
+  local dir=$1 ds=$2; shift 2
+  if zfs list -H -o name "$ds" >/dev/null 2>&1; then
+    log "$ds already exists; skipping create"
+    return 0
+  fi
+
+  local staged=""
+  if [ -d "$dir" ]; then
+    if [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+      staged="$dir.aside.$$"
+      log "renaming $dir -> $staged (one rename; this is your rollback copy, and it is not deleted)"
+      mv -T -- "$dir" "$staged" || die "could not rename $dir aside — nothing was changed"
+    else
+      rmdir -- "$dir" || die "could not rmdir the empty $dir — nothing was changed"
+    fi
+  fi
+
+  if ! zfs create "$@" -o mountpoint="$dir" "$ds"; then
+    if [ -n "$staged" ]; then
+      mv -T -- "$staged" "$dir" && log "rolled back: $dir is exactly as it was"
+    fi
+    die "zfs create $ds failed"
+  fi
+  chown "$WT_TARGET_UID:$WT_TARGET_GID" "$dir"
+
+  if [ -n "$staged" ]; then
+    log "copying $staged/ into the new dataset at $dir/"
+    rsync -aHAX "$staged"/ "$dir"/ \
+      || die "copy into $ds failed — your data is untouched at $staged"
+    verify_identical "$staged" "$dir"
+    log "$dir is now $ds. The pre-migration copy is at $staged; remove it when you are satisfied:"
+    log "    rm -rf $staged"
+  fi
+  log "created $ds mounted at $dir"
+}
+
+# Each WT_SNAPSHOT_EXCLUDE entry becomes $WT_DS_SRC/<sub>, mounted at <checkout>/<sub>.
+create_exclude_dataset() { promote_dir_to_dataset "$CHECKOUT_DIR/$1" "$WT_DS_SRC/$1"; }
 
 # Cheap post-copy proof that nothing was dropped. Exact for a subtree we copied whole.
 verify_identical() {
@@ -265,38 +324,88 @@ if ! zfs list -H -o name "$WT_DS_SRC" >/dev/null 2>&1 \
   fi
 fi
 
-# ---- the source dataset -------------------------------------------------------------------
-migrated=0
+# ---- preflight ----------------------------------------------------------------------------
+# Every check, before every action. This script's one job is to move somebody's only checkout into
+# a dataset, and the worst way to fail at it is halfway: a directory emptied, a diagnostic naming
+# the wrong cause, and no statement of where the data actually went. So decide up front whether
+# the whole plan can succeed, and refuse while the world is still exactly as the user left it.
+plan=()
+PLAN_MIGRATE=0
+
 if zfs list -H -o name "$WT_DS_SRC" >/dev/null 2>&1; then
-  mp=$(zfs get -H -o value mountpoint "$WT_DS_SRC" 2>/dev/null || true)
-  [ "$mp" = "$CHECKOUT_DIR" ] \
-    || log "warning: $WT_DS_SRC is mounted at '$mp', not $CHECKOUT_DIR — wt clones whatever is at the mountpoint"
-  log "$WT_DS_SRC already exists; skipping checkout migration"
+  _mp=$(zfs get -H -o value mountpoint "$WT_DS_SRC" 2>/dev/null || true)
+  [ "$_mp" = "$CHECKOUT_DIR" ] \
+    || log "warning: $WT_DS_SRC is mounted at '$_mp', not $CHECKOUT_DIR — wt clones whatever is at the mountpoint"
+  plan+=( "$WT_DS_SRC exists — no checkout migration" )
 elif [ ! -e "$CHECKOUT_DIR" ]; then
-  # Nothing to preserve: hand back an empty dataset and let them clone the repo into it.
-  log "creating $WT_DS_SRC at $CHECKOUT_DIR (nothing there yet — clone your repo into it afterwards)"
-  zfs create -o mountpoint="$CHECKOUT_DIR" -o xattr=sa -o acltype=posixacl "$WT_DS_SRC"
-  chown "$WT_TARGET_UID:$WT_TARGET_GID" "$CHECKOUT_DIR"
+  plan+=( "create $WT_DS_SRC, empty, at $CHECKOUT_DIR (clone your repo into it afterwards)" )
 else
   [ -d "$CHECKOUT_DIR" ] || die "$CHECKOUT_DIR exists but is not a directory"
-  command -v rsync >/dev/null 2>&1 || die "rsync not found — needed to migrate the checkout into $WT_DS_SRC"
-  owner=$(mount_owner_of "$CHECKOUT_DIR")
-  [ -z "$owner" ] \
-    || die "$CHECKOUT_DIR is already the mountpoint of $owner — set WT_DS_SRC=$owner, or unmount it first"
+  _owner=$(mount_owner_of "$CHECKOUT_DIR")
+  [ -z "$_owner" ] \
+    || die "$CHECKOUT_DIR is already the mountpoint of $_owner — set WT_DS_SRC=$_owner, or unmount it first"
+  # An ext4/bind mountpoint would sail past mount_owner_of, and then `mv` would fail EBUSY. Better
+  # to say so now, by name, than to discover it with the checkout half-moved.
+  ! is_mountpoint "$CHECKOUT_DIR" \
+    || die "$CHECKOUT_DIR is a mountpoint ($(what_is_mounted_at "$CHECKOUT_DIR")), not a plain directory.
+    It cannot be moved aside while something is mounted on it. Unmount it, or make WT_DS_SRC the
+    dataset that is already there."
   # The aside is the ONLY copy of the pre-migration checkout while the copy runs. Clobbering one
   # from an earlier (possibly half-finished) run would destroy exactly the thing it exists for.
   [ ! -e "$ASIDE_DIR" ] \
     || die "$ASIDE_DIR already exists; refusing to overwrite it — move or remove it first"
+  [ -w "$(dirname -- "$CHECKOUT_DIR")" ] \
+    || die "$(dirname -- "$CHECKOUT_DIR") is not writable — cannot move the checkout aside"
+  PLAN_MIGRATE=1
+  plan+=( "move $CHECKOUT_DIR -> $ASIDE_DIR, create $WT_DS_SRC there, copy the content back" )
+fi
 
-  confirm "move $CHECKOUT_DIR aside to $ASIDE_DIR and recreate it as ZFS dataset $WT_DS_SRC?"
+# Shape-check every excluded subpath before creating ANY of them: a bad entry found on the third
+# of four would leave a half-provisioned source dataset behind.
+for sub in $WT_SNAPSHOT_EXCLUDE; do
+  check_exclude_entry "$sub"
+  check_promotable "$CHECKOUT_DIR/$sub" "$WT_DS_SRC/$sub"
+  zfs list -H -o name "$WT_DS_SRC/$sub" >/dev/null 2>&1 \
+    || plan+=( "create $WT_DS_SRC/$sub at $CHECKOUT_DIR/$sub (never snapshotted; shared by every sandbox)" )
+done
 
-  log "mv $CHECKOUT_DIR -> $ASIDE_DIR (nothing is deleted; this is your rollback copy)"
-  mv -- "$CHECKOUT_DIR" "$ASIDE_DIR"
+check_promotable "$WT_DIR" "$WT_DS_PARENT"
+zfs list -H -o name "$WT_DS_PARENT" >/dev/null 2>&1 \
+  || plan+=( "create $WT_DS_PARENT at $WT_DIR (the per-sandbox clones hang under it)" )
+
+plan+=( "delegate zfs snapshot/clone/destroy/mount/... to $DELEGATE (uid $WT_TARGET_UID)" )
+
+# rsync moves the content into every dataset we create over a non-empty directory. Find out it is
+# missing now, not with the checkout already renamed aside.
+if [ "$PLAN_MIGRATE" -eq 1 ] || [ -n "$WT_SNAPSHOT_EXCLUDE" ]; then
+  command -v rsync >/dev/null 2>&1 \
+    || die "rsync not found — it is what moves your content into the new datasets"
+fi
+
+log "plan:"
+for p in "${plan[@]}"; do log "  - $p"; done
+if [ "$PLAN_MIGRATE" -eq 1 ]; then
+  confirm "this moves your checkout at $CHECKOUT_DIR. Nothing is deleted — $ASIDE_DIR is kept as your rollback. Proceed?"
+fi
+
+# ---- the source dataset -------------------------------------------------------------------
+migrated=0
+if [ "$PLAN_MIGRATE" -eq 1 ]; then
+  log "mv $CHECKOUT_DIR -> $ASIDE_DIR (one rename; nothing is deleted, this is your rollback copy)"
+  mv -T -- "$CHECKOUT_DIR" "$ASIDE_DIR"
 
   log "zfs create $WT_DS_SRC (mountpoint=$CHECKOUT_DIR)"
-  zfs create -o mountpoint="$CHECKOUT_DIR" -o xattr=sa -o acltype=posixacl "$WT_DS_SRC"
+  if ! zfs create -o mountpoint="$CHECKOUT_DIR" -o xattr=sa -o acltype=posixacl "$WT_DS_SRC"; then
+    mv -T -- "$ASIDE_DIR" "$CHECKOUT_DIR" && log "rolled back: $CHECKOUT_DIR is exactly as it was"
+    die "zfs create $WT_DS_SRC failed"
+  fi
   chown "$WT_TARGET_UID:$WT_TARGET_GID" "$CHECKOUT_DIR"
   migrated=1
+elif ! zfs list -H -o name "$WT_DS_SRC" >/dev/null 2>&1; then
+  # Nothing to preserve: hand back an empty dataset and let them clone the repo into it.
+  log "creating $WT_DS_SRC at $CHECKOUT_DIR (nothing there yet — clone your repo into it afterwards)"
+  zfs create -o mountpoint="$CHECKOUT_DIR" -o xattr=sa -o acltype=posixacl "$WT_DS_SRC"
+  chown "$WT_TARGET_UID:$WT_TARGET_GID" "$CHECKOUT_DIR"
 fi
 
 # ---- the never-snapshotted children -------------------------------------------------------

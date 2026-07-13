@@ -6,6 +6,16 @@
 # target uid and execs the command. The mount namespace dies with this process tree, so the ZFS
 # mount cleans itself up on exit; nothing to umount.
 #
+# THIS SCRIPT IS NOT A SECURITY BOUNDARY, and must not be made into one.
+#
+# It is root-equivalent BY DESIGN: running as root, it takes WT_CANONICAL, WT_SRC_CLONE, WT_PATH
+# and the hook command straight from its environment, and then mounts, chowns, and `rm -rf`s with
+# them. That is fine in wt's intended setting, where the user already has blanket sudo — it hands
+# them nothing they did not have. It is NOT fine as a privilege gate. Do not write a "narrow"
+# NOPASSWD sudoers rule for `unshare ... wt-setup.sh` believing it contains anything: whoever can
+# invoke it can choose what root mounts and what root deletes. If you need a real boundary, put it
+# around who may run `wt` at all.
+#
 # Knows nothing about any project, language or toolchain. Everything project-specific arrives as
 # WT_* env from `wt`, or is done by the enter hook.
 set -euo pipefail
@@ -22,6 +32,13 @@ apply_hook_env() {
     export "${kv%%=*}=${kv#*=}"
   done
 }
+
+# Flatten an excluded subpath into one hold-dir component. Injective — escape the escape
+# character, then the separator (_ -> _U, / -> _S) — so two excluded subpaths can never land on
+# the same hold path and cross-wire their bind mounts. `wt` defines this identically, and
+# test-config-unit.sh asserts the two agree: they are derived independently on either side of the
+# sudo boundary, so a drift here would silently mis-bind a sandbox's shared directories.
+exclude_key() { local s=${1//_/_U}; printf '%s' "${s//\//_S}"; }
 
 # The privilege drop, as one overridable command. --init-groups needs CAP_SETGID even to "drop"
 # to the ids we already hold, so an unprivileged unit test cannot call setpriv at all and
@@ -86,7 +103,7 @@ export PATH="${WT_PATH:-$PATH}"
 # reachable from inside the namespace.
 mount --bind "$WT_GIT_REAL" "$WT_GIT_HOLD"
 for sub in ${WT_SNAPSHOT_EXCLUDE:-}; do
-  hold="$WT_HOLD_DIR/${sub//\//_}"          # keep this key in sync with wt's exclude_key()
+  hold="$WT_HOLD_DIR/$(exclude_key "$sub")"
   mkdir -p "$hold"
   mount --bind "$WT_CANONICAL/$sub" "$hold"
 done
@@ -101,7 +118,7 @@ mount -t zfs "$WT_SRC_CLONE" "$WT_CANONICAL"
 # child-dataset mountpoints — the children were never snapshotted, so none of their data is
 # there. Binding the canonical copy back over them gives every sandbox ONE shared live copy.
 for sub in ${WT_SNAPSHOT_EXCLUDE:-}; do
-  mount --bind "$WT_HOLD_DIR/${sub//\//_}" "$WT_CANONICAL/$sub"
+  mount --bind "$WT_HOLD_DIR/$(exclude_key "$sub")" "$WT_CANONICAL/$sub"
 done
 
 # Swap the clone's snapshot-frozen .git directory for the worktree pointer file, so git in the

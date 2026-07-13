@@ -98,6 +98,13 @@ snapshots *are* the tool. Also: Linux, for mount namespaces; `sudo`, because mou
 dataset needs real root (the ZFS module refuses the mount from inside a user namespace, so
 unprivileged containers alone will not do); and git ≥ 2.17, for `git worktree remove`.
 
+**`wt` is not a privilege boundary.** It assumes you already have sudo, and it uses it to mount a
+clone and then immediately drop back to your own uid — so it gives you nothing you did not
+already have. But `wt-setup.sh` runs as root and takes the paths it mounts, chowns and deletes
+from its environment. Do not hand it to someone you would not hand root to, and do not write a
+"narrow" NOPASSWD sudoers rule for it believing that contains it: whoever can invoke it chooses
+what root mounts and what root deletes. Gate who may run `wt` at all, not what it does once run.
+
 ## Editor over SSH, with no listening port
 
 `wt-ssh` runs on your machine, not in the container, and hands your editor an SSH session
@@ -131,6 +138,7 @@ so the destroy can proceed. The flock protects sessions, not stragglers.)
 ## Tests
 
 ```sh
+test/test-config-unit.sh    # config resolution (env > file > default) + the shared derivations
 test/test-gc-unit.sh        # snapshot provenance: gc reaps only what wt created
 test/test-newrm-unit.sh     # wt new / wt rm: the create and destroy paths
 test/test-hooks-unit.sh     # the hook contract, incl. the exit-code gate

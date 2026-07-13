@@ -44,8 +44,9 @@
 #   wt gc                         reclaim orphan snapshots/clones whose sandbox is gone
 #   wt status                     show config + dataset state
 #
-# SSH plumbing. `wt-ssh` and sshd call these; you don't:
-#   wt ssh-setup                  write $WT_SSH_DIR sshd config + authorized_keys
+# SSH plumbing. You run ssh-setup once (from the container's start hook); `wt-ssh` and sshd call
+# the rest:
+#   wt ssh-setup                  write $WT_SSH_DIR sshd config + authorized_keys   <- YOU, once
 #   wt ssh-config [repo]          emit ~/.ssh/config blocks          <- `wt-ssh config`
 #   wt ssh-serve  <name>          inetd sshd entry over docker exec  <- `wt-ssh proxy <name>`
 #   wt ssh-forced                 sshd ForceCommand -> wt enter <name>
@@ -157,19 +158,33 @@ safe_rmrf() {
   rm -rf -- "$p"
 }
 
-# A leading dash would survive as a dataset component ZFS rejects, aborting `wt new` after the
-# snapshot and worktree already exist and leaving both to be cleaned up by hand.
+# A sandbox name ends up in a dataset path, a snapshot name, a branch name, a marker filename and
+# an `rm -rf` argument. Restrict it to one character class up front, with no leading dash, so no
+# consumer downstream can parse it as a flag or reject it halfway through `wt new` — which would
+# leave the snapshot and worktree already made and needing cleanup by hand.
 validate_name() { case "${1:-}" in ''|-*|*[!a-zA-Z0-9_-]*) die "invalid sandbox name: '${1:-}'";; esac; }
 
-# Flatten an excluded subpath ("build/logs") into a single hold-dir component ("build_logs").
-# wt-setup.sh derives the identical name — keep the two in sync.
-exclude_key() { printf '%s' "${1//\//_}"; }
+# Flatten an excluded subpath ("build/logs") into one hold-dir component ("build_Slogs").
+#
+# The encoding must be INJECTIVE, or two excluded subpaths can land on the same hold path — and
+# then wt-setup.sh binds the second one's live data over BOTH of them inside the sandbox, so
+# writes meant for one shared directory silently land in the other. Escaping only '/' does not
+# achieve that: a real directory named "build_Slogs" would collide with the subpath "build/logs".
+# So escape the escape character first, then the separator:
+#     _ -> _U       /  -> _S
+# wt-setup.sh defines this identically; test-config-unit.sh asserts the two agree.
+exclude_key() { local s=${1//_/_U}; printf '%s' "${s//\//_S}"; }
 
 # --- session liveness ---------------------------------------------------------------------
-# $WT_HOME lives on persistent storage and the EXIT trap never runs on SIGKILL
-# (OOM kill, `docker kill`, host crash), so a marker file's existence proves nothing. A session
-# is live only while its creator still holds an exclusive flock on the marker; the lock dies
-# with the process, whatever kills it. sudo closes fds >= 3, so no descendant inherits it.
+# $WT_HOME lives on persistent storage and the EXIT trap never runs on SIGKILL (OOM kill,
+# `docker kill`, host crash), so a marker file's existence proves nothing. A session is live only
+# while its creator still holds an exclusive flock on the marker; the lock dies with the process,
+# whatever kills it.
+#
+# Which makes an inherited fd the one way to fake liveness — a daemon that inherits the open
+# marker holds the lock long after the session is gone. sudo's closefrom(3) would drop it anyway,
+# but the closes are explicit (`9>&-` into the sandbox, `8>&-` into the teardown hook) rather than
+# a bet on how someone's sudoers is configured.
 WT_LOCK_DIR=$WT_HOME/locks
 
 # Serialize new/rm/enter for one sandbox, so `wt rm` can't sample "not in use" in the window
@@ -181,7 +196,23 @@ lock_name() {
 }
 unlock_name() { exec 8>&-; }
 
-marker_live() { [ -e "$1" ] && ! flock -n "$1" true 2>/dev/null; }
+# Is a session still holding this marker's lock?
+#
+# Open the marker READ-ONLY and lock that fd. `flock <path> ...` would open the path with O_CREAT,
+# so the probe would CREATE the very marker it is asking about — resurrecting, as an empty stale
+# marker, one that an exiting session had just removed. A predicate must not write.
+# (LOCK_EX on a read-only fd is fine: flock(2) locks the open file description, not the access
+# mode. That is not true of fcntl locks, which is the trap this looks like.)
+# The redirects hang off a COMPOUND, never off a bare `exec`: `exec 7<f 2>/dev/null` would make
+# BOTH permanent for the whole shell, silencing wt's own stderr for the rest of the run. And
+# 2>/dev/null comes FIRST, so a failed open is quiet — redirections are applied left to right.
+# The fd, and with it the lock, is released when the compound finishes.
+marker_live() {
+  local got=1
+  { if flock -n -x 7; then got=0; fi; } 2>/dev/null 7<"$1" || return 1  # gone: no session holds it
+  [ "$got" -eq 0 ] && return 1                                          # we took it: nobody had it
+  return 0
+}
 
 name_active() {
   local m
@@ -421,7 +452,9 @@ wt_list() {
   for d in "$WT_HOME"/trees/*/; do
     [ -d "$d" ] || continue
     name=$(basename "$d")
-    br="wt/$name"   # deterministic by construction; avoids a git lookup that fails inside a sandbox
+    # The branch wt new CREATED, not necessarily the sandbox's current HEAD — a sandbox can check
+    # out anything. Named by construction to avoid a git lookup, which fails from inside a sandbox.
+    br="wt/$name"
     used=$(zfs get -H -o value used "$WT_DS_PARENT/$name" 2>/dev/null); [ -n "$used" ] || used='?'
     # Count sessions, not marker files: a SIGKILLed session leaves its marker behind.
     act=0; for f in "$WT_HOME"/active/"$name".*; do marker_live "$f" && act=$((act+1)); done
