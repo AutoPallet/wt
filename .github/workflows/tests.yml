@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every shipped script must at least parse. Cheap, and it catches the class of typo that
+      # only surfaces at `wt enter` time — i.e. after a sandbox already exists.
+      - name: syntax
+        run: |
+          for f in wt wt-setup.sh wt-ssh install.sh host-zfs-setup.sh test/*.sh test/spikes/*.sh; do
+            bash -n "$f" || exit 1
+          done
+
+      # The unit suites are hermetic: zfs, docker, setpriv and the hooks are stubbed on PATH, so
+      # they need no pool, no root and no container. That is the whole point of them — they gate
+      # every push, on a runner that has none of wt's real dependencies.
+      - name: unit tests
+        run: |
+          rc=0
+          for t in test/test-*-unit.sh; do
+            echo "--- $t"
+            bash "$t" || rc=1
+          done
+          exit $rc
