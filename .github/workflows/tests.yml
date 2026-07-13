@@ -19,9 +19,19 @@ jobs:
             bash -n "$f" || exit 1
           done
 
-      # The unit suites are hermetic: zfs, docker, setpriv and the hooks are stubbed on PATH, so
-      # they need no pool, no root and no container. That is the whole point of them — they gate
-      # every push, on a runner that has none of wt's real dependencies.
+      # `bash -n` is blind to the failure mode that actually matters here: an unquoted expansion
+      # or a word-split in code that runs `rm -rf` and `zfs destroy`. The sources already carry
+      # `shellcheck disable` directives, so this only enforces a standard they were written to.
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -x -S warning wt wt-setup.sh wt-ssh install.sh host-zfs-setup.sh
+
+      # The unit suites are hermetic: zfs, git and the hooks are stubbed on PATH, docker is a
+      # shell function, and the setpriv privilege drop is disabled through its WT_DROP_PRIV seam.
+      # So they need no pool, no root and no container — which is the whole point. They gate the
+      # create and destroy paths (`wt new`, `wt rm`) on a runner that has none of wt's real
+      # dependencies.
       - name: unit tests
         run: |
           rc=0

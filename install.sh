@@ -81,15 +81,21 @@ if [ ! -d "$PREFIX" ] || [ ! -w "$PREFIX" ]; then
   fi
 fi
 
-# Refuse to clobber a stranger's file. A prefix like /usr/local/bin is shared ground and `wt` is
-# a short, plausible name. Ours = a symlink (the only kind we ever create) or a file from this
-# toolset — every one of wt/wt-setup.sh/wt-ssh mentions WT_CANONICAL, and nothing else does, so
-# an older wt still upgrades silently while an unrelated `wt` binary stops us.
+# Refuse to clobber a stranger's file. A prefix like /usr/local/bin is shared ground and `wt` is a
+# short, plausible name. The test is the same either way — does the file it resolves to look like
+# one of ours? Every one of wt/wt-setup.sh/wt-ssh mentions WT_CANONICAL and nothing else does, so
+# an older wt upgrades silently while an unrelated `wt` stops us.
+#
+# Following the symlink is the point. "It's a symlink, so we must have made it" is not an
+# argument: stow, nix-profile, asdf and friends all manage their tools as symlinks, and a bare
+# -L test would silently replace one of theirs.
 ours() {
   local dst=$1
   [ -e "$dst" ] || [ -L "$dst" ] || return 0            # nothing there: fine
-  [ -L "$dst" ] && return 0
-  grep -qs -- 'WT_CANONICAL' "$dst"
+  # A symlink that dangles is broken whoever made it — most likely ours, from a checkout that has
+  # since moved. Replacing it takes nothing from anyone.
+  if [ -L "$dst" ] && [ ! -e "$dst" ]; then return 0; fi
+  grep -qs -- 'WT_CANONICAL' "$dst"                     # follows the link, if it is one
 }
 
 install_one() {

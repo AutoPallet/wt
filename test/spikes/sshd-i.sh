@@ -70,7 +70,7 @@ PermitRootLogin no
 AllowUsers $TESTUSER
 AuthorizedKeysFile $WORK/authorized_keys
 AcceptEnv WT_SANDBOX
-SetEnv WT_SANDBOX=scan
+SetEnv WT_SANDBOX=demo
 ForceCommand $WORK/forcecmd.sh
 LogLevel ERROR
 EOF
@@ -83,7 +83,7 @@ out=$(ssh -F /dev/null \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o "ProxyCommand=sudo /usr/sbin/sshd -i -f $WORK/sshd_config" \
     -i "$WORK/id" \
-    "$TESTUSER@wt-sandbox" "code-server-bootstrap --start-server" 2>"$WORK/ssh.err")
+    "$TESTUSER@wt-sandbox" "my-editor-server --start" 2>"$WORK/ssh.err")
 rc=$?
 echo "--- client stdout ---"
 echo "$out"
@@ -92,8 +92,8 @@ echo "--- client exit rc=$rc ---"
 
 if [ "$rc" -eq 0 ] \
   && [[ "$out" == *"FORCECOMMAND ran: uid="*" user=$TESTUSER"* ]] \
-  && [[ "$out" == *"WT_SANDBOX=[scan]"* ]] \
-  && [[ "$out" == *"SSH_ORIGINAL_COMMAND=[code-server-bootstrap --start-server]"* ]]; then
+  && [[ "$out" == *"WT_SANDBOX=[demo]"* ]] \
+  && [[ "$out" == *"SSH_ORIGINAL_COMMAND=[my-editor-server --start]"* ]]; then
   echo "PASS sshd-i: key auth + ForceCommand over the sshd -i stdio pipe, env + original command forwarded correctly"
 else
   echo "FAIL sshd-i: handshake/ForceCommand did not behave as expected (rc=$rc)"

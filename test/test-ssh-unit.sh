@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Fast, hermetic unit tests for wt-ssh container resolution + verb dispatch (no docker/root needed).
 set -uo pipefail
-# Hermetic, and this is the sharp edge: wt resolves config as env > file > default. Setting
-# WT_CONFIG= keeps an installed /etc/wt/config out, but says nothing about the ENVIRONMENT — and
-# every `wt enter` exports a WT_* bundle, so running this suite inside a sandbox would quietly
-# feed the code under test that sandbox's real config. It passed for the wrong reason. Scrub the
-# inherited namespace first; everything the tests depend on is set explicitly below.
+# wt-ssh runs on the HOST, so it cannot read the container's /etc/wt/config: it resolves config as
+# env > <repo>/.wt.conf > default, and WT_SSH_CONFIG= (set below) closes the file channel. But
+# neither says anything about the ENVIRONMENT, and every `wt enter` exports a WT_* bundle — run
+# this suite inside a sandbox and it would quietly feed the code under test that sandbox's real
+# config. Scrub the inherited namespace first; everything the tests depend on is set explicitly.
 while IFS= read -r _v; do unset "$_v"; done < <(compgen -v | grep '^WT_' || true)
 
 DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -17,11 +17,21 @@ no(){ FAIL=$((FAIL+1)); echo "  FAIL  $1 (got: ${2:-})"; }
 # Mock docker: two running containers; only c2 mounts $WT_CANONICAL from the target repo
 # (with a trailing slash, as docker sometimes records). WT_SSH_DRYRUN stops wt-ssh before the real
 # `exec docker exec`, printing the resolved argv instead.
+#
+# The mock checks the QUERY, not just the container id. resolve() asks docker for the Source of
+# the mount whose Destination is $WT_CANONICAL, via a Go --format template; a mock that answers on
+# the id alone would return the right container even if that template were nonsense, leaving half
+# of the resolution predicate as unexecuted logic wearing a green badge. So: no well-formed
+# template, no answer.
 ENV="WT_SSH_CONFIG= WT_CANONICAL=/workspaces/myrepo WT_TARGET_USER=dev"
 run_wt_ssh() { env $ENV WT_SSH_DRYRUN=1 WT_SSH_REPO=/home/u/myrepo \
   bash -c 'docker(){ case "$1" in
       ps) echo c1; echo c2;;
-      inspect) case "$2" in c1) echo /home/u/other;; c2) echo /home/u/myrepo/;; esac;;
+      inspect)
+        case "$*" in
+          *.Destination*/workspaces/myrepo*.Source*)
+            case "$2" in c1) echo /home/u/other;; c2) echo /home/u/myrepo/;; esac ;;
+        esac ;;
     esac; }; export -f docker; exec "$@"' _ "$WTSSH" "$@"; }
 
 out=$(run_wt_ssh proxy scan)

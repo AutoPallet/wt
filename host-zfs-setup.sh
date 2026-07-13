@@ -21,7 +21,8 @@
 #
 #   * A devcontainer install typically keeps its config INSIDE the checkout and only maps it to
 #     /etc/wt/config in the image — the host has no such file, so point WT_CONFIG at the real
-#     one:   WT_CONFIG=.config/wt.conf ./host-zfs-setup.sh ~/src/myrepo
+#     one:   WT_CONFIG=~/src/myrepo/.config/wt.conf ./host-zfs-setup.sh ~/src/myrepo
+#     (WT_CONFIG is resolved from the directory you run this from, not from the checkout.)
 #   * WT_CANONICAL is the checkout path as the CONTAINER sees it (/workspaces/myrepo). The
 #     dataset must be mounted where the HOST sees the checkout (~/src/myrepo). When those
 #     differ — they usually do — pass the host path as the first argument.
@@ -41,8 +42,9 @@ log() { echo "host-zfs-setup: $*" >&2; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; }
 
 # Root is needed for zfs create/mount, chown, and the `sudo -u` delegation probe. -E so a WT_*
-# override (WT_CONFIG above all) set by the caller survives into the root pass; if sudoers
-# forbids -E the config search below still finds the same file, it just cannot be overridden.
+# override (WT_CONFIG above all) set by the caller survives into the root pass. A sudoers policy
+# that forbids -E makes sudo refuse the command outright rather than degrade — run this as root
+# directly if that is your setup.
 if [ "$(id -u)" -ne 0 ]; then
   exec sudo -E "$0" "$@"
 fi
@@ -97,10 +99,17 @@ WT_TARGET_USER=${WT_TARGET_USER:-}
 # A bare pool name has no parent to create it under, and `zfs create` cannot make one.
 case "$WT_DS_SRC"    in */*) ;; *) die "WT_DS_SRC='$WT_DS_SRC' names a pool, not a dataset" ;; esac
 case "$WT_DS_PARENT" in */*) ;; *) die "WT_DS_PARENT='$WT_DS_PARENT' names a pool, not a dataset" ;; esac
-# `wt gc` destroys every child of $WT_DS_PARENT. Pointed inside the source dataset it would
-# reach the WT_SNAPSHOT_EXCLUDE children — the live, never-snapshotted data every sandbox shares.
+# The two datasets must be DISJOINT, in both directions — `wt` refuses the same two layouts, and
+# for the same reason. `wt gc` destroys the children of $WT_DS_PARENT. With the parent inside the
+# source, that reaches the WT_SNAPSHOT_EXCLUDE children. With the SOURCE inside the parent, gc
+# enumerates the source dataset and those same children as "orphan clones" and destroys them —
+# and an exclude child holds the only, never-snapshotted copy of its data. Nesting either way
+# points a destroy loop at live data.
 case "$WT_DS_PARENT" in
   "$WT_DS_SRC"|"$WT_DS_SRC"/*) die "WT_DS_PARENT must not be, or live under, WT_DS_SRC ($WT_DS_SRC)" ;;
+esac
+case "$WT_DS_SRC" in
+  "$WT_DS_PARENT"/*) die "WT_DS_SRC must not live under WT_DS_PARENT ($WT_DS_PARENT)" ;;
 esac
 
 CHECKOUT_DIR=${args[0]:-$WT_CANONICAL}
@@ -119,8 +128,7 @@ ASIDE_DIR=$CHECKOUT_DIR.aside
 #
 # If the configured name DOES exist on the host but under a different uid, stop: delegating to
 # it would hand the permissions to an identity no sandbox ever runs as, and every `wt new` would
-# then fail with a permission error nobody can explain. This is the generic form of the old
-# "host user must be uid 1000, or the delegation would not apply" assertion.
+# then fail with a permission error nobody can explain.
 [ "$WT_TARGET_UID" != 0 ] \
   || die "WT_TARGET_UID resolved to 0 — sandboxes must not run as root; set WT_TARGET_UID in the config"
 if [ -n "$WT_TARGET_USER" ] && getent passwd "$WT_TARGET_USER" >/dev/null 2>&1; then
@@ -346,9 +354,11 @@ promote_dir_to_dataset "$WT_DIR" "$WT_DS_PARENT" -o xattr=sa -o acltype=posixacl
 for ds in "$WT_DS_SRC" "$WT_DS_PARENT"; do
   zfs allow -s @wt-ops create,destroy,mount,clone,snapshot,promote,hold,release,rename,userprop "$ds"
 done
-# `wt new` clones with -o mountpoint=legacy -o canmount=noauto; setting properties at clone time
-# needs permission for those properties on the dataset being created.
-zfs allow -s @wt-props mountpoint,canmount,readonly,compression "$WT_DS_PARENT"
+# `wt new` clones with -o mountpoint=legacy -o canmount=noauto, and setting a property at clone
+# time needs permission for that property. Exactly those two, and nothing else wt does not set:
+# this script's promise is that it grants what wt needs and no more, and headroom "in case" is
+# how that promise rots.
+zfs allow -s @wt-props mountpoint,canmount "$WT_DS_PARENT"
 
 # -l AND -d: `-l` because the snapshot is named $WT_DS_SRC@... and the permission to create it
 # lives on $WT_DS_SRC itself, not on a descendant; `-d` so the descendants (the exclude children,

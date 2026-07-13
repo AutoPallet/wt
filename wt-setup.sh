@@ -23,40 +23,44 @@ apply_hook_env() {
   done
 }
 
-# The privilege drop, as one overridable command. setpriv needs CAP_SETUID even to "drop" to the
-# uid it is already at, so an unprivileged unit test cannot call it and substitutes a no-op
-# (WT_DROP_PRIV=). Real setuid, not a nested userns: a userns would shadow every host uid it
-# didn't map, so files owned by other users would appear as nobody (65534) and git and build
-# tools would reject them with dubious-ownership or permission-denied.
+# The privilege drop, as one overridable command. --init-groups needs CAP_SETGID even to "drop"
+# to the ids we already hold, so an unprivileged unit test cannot call setpriv at all and
+# substitutes a no-op (WT_DROP_PRIV=). Real setuid, not a nested userns: a userns would shadow
+# every host uid it didn't map, so files owned by other users would appear as nobody (65534) and
+# git and build tools would reject them with dubious-ownership or permission-denied.
 WT_TARGET_UID=${WT_TARGET_UID:-$(id -u)}
 WT_TARGET_GID=${WT_TARGET_GID:-$(id -g)}
 WT_DROP_PRIV=${WT_DROP_PRIV-setpriv --reuid=$WT_TARGET_UID --regid=$WT_TARGET_GID --init-groups --inh-caps=-all --}
 
-# Run the enter hook as the target user, in THIS namespace, and fold its emitted env into ours.
+# Run the enter hook as the target user, in THIS namespace, and fold the env it prints into ours.
 # wt has no idea what the hook starts.
 #
-# "Best-effort" is scoped deliberately, because getting it wrong is silently destructive:
+# The hook's exit code GATES the session: anything non-zero aborts. That is a deliberate choice to
+# fail loudly rather than quietly, because a half-set-up sandbox is the expensive failure. Consider
+# a hook whose job is to hand the session a PER-SANDBOX build-daemon socket: if it doesn't run, the
+# session doesn't get that env, falls back to the tool's SHARED default, and one daemon in one
+# namespace writes every sandbox's build outputs into the WRONG clone. You would not find out from
+# an error; you would find out from a corrupt artifact days later.
 #
-#   ran, then failed   -> CONTINUE. It may have set up part of what it promised, and whatever env
-#                         it managed to print still applies. (A well-written hook prints its env
-#                         FIRST, before anything that can fail.)
-#   could not RUN      -> ABORT, loudly. The session would inherit NONE of what the hook
-#     (126/127)           guarantees. For a hook handing out a per-sandbox daemon socket, that
-#                         means quietly falling back to a SHARED one — and writing this sandbox's
-#                         build outputs into another sandbox's clone. A missing hook is a config
-#                         error, not a runtime hiccup, and a hard error beats corrupt artifacts.
+# Sniffing exit codes to tell "the hook could not start" (126/127) from "the hook ran and failed"
+# cannot work, and trying was a bug: through `bash -c`, a hook that ends in an exec of a missing
+# binary is also 127, and a privilege drop that fails is 1 — so the case that most needed the abort
+# got classified as tolerable. One rule, no classification: non-zero is non-zero.
+#
+# A hook step that is genuinely advisory should say so with `|| true`.
 run_enter_hook() {
   [ -n "${WT_HOOK_ENTER:-}" ] || return 0
   local out rc=0
+  # stdout is captured (it is the env channel); stderr is left alone, so the hook's diagnostics
+  # reach the terminal. A hook that wants to be quiet redirects itself: WT_HOOK_ENTER='h 2>/dev/null'.
   # shellcheck disable=SC2086  # deliberate word-split: WT_DROP_PRIV is a command plus its args
-  out=$($WT_DROP_PRIV bash -c "$WT_HOOK_ENTER" 2>/dev/null) || rc=$?
-  if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
-    echo "wt: enter hook could not be executed: $WT_HOOK_ENTER" >&2
-    echo "wt: refusing to continue — the session would silently lose everything the hook sets up." >&2
-    echo "wt: a sandbox cloned BEFORE the hook existed will not have it; recreate it." >&2
+  out=$($WT_DROP_PRIV bash -c "$WT_HOOK_ENTER") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "wt: enter hook failed (rc=$rc): $WT_HOOK_ENTER" >&2
+    echo "wt: refusing to continue — the session would be missing whatever the hook sets up." >&2
+    echo "wt: (a sandbox cloned BEFORE the hook existed will not have it; recreate it.)" >&2
     exit 1
   fi
-  [ "$rc" -eq 0 ] || echo "wt: enter hook failed (rc=$rc); continuing with the env it emitted" >&2
   # Here-string, NOT a pipe: a pipe runs apply_hook_env in a subshell, whose exports die with it.
   apply_hook_env <<<"$out"
 }
