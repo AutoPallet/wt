@@ -1,0 +1,635 @@
+#!/bin/bash
+# wt — throwaway build sandboxes with instant zero-diff builds, via per-sandbox ZFS clones.
+#
+# Each sandbox is a git worktree that, inside its own mount namespace, appears at the SAME
+# canonical path as your main checkout ($WT_CANONICAL) — but is a per-sandbox ZFS clone of it,
+# build outputs and all. `zfs snapshot` + `zfs clone` are O(milliseconds), so `wt new` is fast
+# and live: each sandbox clones main's CURRENT tree, with no warm-base step. Sandbox writes go
+# to the clone (CoW from the snapshot); main and every other sandbox are untouched by
+# construction.
+#
+# Because the sandbox lives at the SAME path as main and its sources and build outputs come
+# from ONE atomic snapshot, their mtimes stay mutually consistent — so an mtime-based build
+# system (cargo, make, ninja) sees a fully warm tree and rebuilds only what you actually edit.
+# No content-hashing flag, no mtime-aging hack, no path remapping.
+#
+# Sandboxes share main's live `.git` via an in-namespace bind mount (the worktree-pointer
+# mechanism), so branches made in a sandbox are visible from main and push the usual way. The
+# command runs as a real uid (setuid, not a nested userns), so file ownership and capabilities
+# are normal.
+#
+# WHAT wt DOES NOT KNOW: anything about your project. It has no language, toolchain, daemon or
+# cache built in. Per-sandbox daemons and session env come from two HOOKS you configure:
+#   WT_HOOK_ENTER     runs in the sandbox namespace as the target user, once per `wt enter`,
+#                     before the command is exec'd. Whatever KEY=VALUE lines it prints on
+#                     stdout are exported into the session (direnv-style). A hook that ran and
+#                     then failed is tolerated; one that could not be executed aborts, since
+#                     the session would silently lose everything the hook guarantees.
+#   WT_HOOK_TEARDOWN  runs host-side when a sandbox's resources must be released: the LAST
+#                     session exiting, `wt rm`, and `wt gc`. Must be idempotent. Anything the
+#                     enter hook left running inside the namespace pins the clone's mount and
+#                     would otherwise block `zfs destroy`.
+#
+# Config: $WT_CONFIG, else ~/.config/wt/config, else /etc/wt/config; environment overrides the
+# file. See wt.conf.example. Prerequisite: the host owner ran host-zfs-setup.sh once, to build
+# the datasets and zfs-delegate snapshot/clone/destroy/mount to the target user.
+#
+# Sandbox commands — run these inside the container:
+#   wt new   <name> [ref]         snapshot+clone main's tree, register git worktree pointer
+#   wt enter <name> [-- cmd...]   enter the sandbox (default: bash)
+#   wt claude <name> [args...]    enter and run `claude`
+#   wt list                       list sandboxes + per-clone CoW-exclusive bytes  (host: `wt-ssh list`)
+#   wt rm    <name>               worktree+branch removed, clone+snapshot destroyed
+#   wt gc                         reclaim orphan snapshots/clones whose sandbox is gone
+#   wt status                     show config + dataset state
+#
+# SSH plumbing (optional; used by the companion host-side `wt-ssh`) — not run by hand:
+#   wt ssh-setup                  write $WT_SSH_DIR sshd config + authorized_keys
+#   wt ssh-config [repo]          emit ~/.ssh/config blocks          — host runs it via `wt-ssh config`
+#   wt ssh-serve  <name>          inetd sshd entry over docker exec  — host runs it via `wt-ssh proxy <name>`
+#   wt ssh-forced                 sshd ForceCommand -> wt enter <name>
+set -euo pipefail
+
+SELF_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)   # follow /usr/local/bin/wt symlink
+
+die() { echo "wt: $*" >&2; exit 1; }
+log() { echo "wt: $*" >&2; }
+
+# ---- config ------------------------------------------------------------------------------
+# Precedence: environment > config file > built-in default.
+#
+# The config file is SOURCED (it is shell), so it may compute values. Whatever it sets is then
+# overridden by anything that was already in the environment — that is what the `export -p`
+# snapshot below restores. Searched, unless $WT_CONFIG names a file outright:
+#     $XDG_CONFIG_HOME/wt/config   (default ~/.config/wt/config)
+#     /etc/wt/config
+# WT_CONFIG= (explicitly empty) skips the file entirely. The unit tests set that, so a stray
+# /etc/wt/config on the machine cannot reach in and change their answers.
+_wt_env=$(export -p | grep -E '^declare -x WT_[A-Za-z0-9_]+=' || true)
+if [ -z "${WT_CONFIG+x}" ]; then
+  for _c in "${XDG_CONFIG_HOME:-$HOME/.config}/wt/config" /etc/wt/config; do
+    [ -r "$_c" ] && { WT_CONFIG=$_c; break; }
+  done
+fi
+if [ -n "${WT_CONFIG:-}" ]; then
+  [ -r "$WT_CONFIG" ] || die "config file not readable: $WT_CONFIG"
+  # shellcheck source=/dev/null
+  . "$WT_CONFIG"
+  eval "$_wt_env"        # environment wins over the file
+fi
+
+# The checkout wt clones, and the ZFS datasets behind it (made by host-zfs-setup.sh). No
+# sensible default exists for these — an install must declare them. See wt.conf.example.
+WT_CANONICAL=${WT_CANONICAL:-}
+WT_DS_SRC=${WT_DS_SRC:-}
+WT_DS_PARENT=${WT_DS_PARENT:-}
+
+# Sandbox state (trees/, meta/, active/, locks/). On the host, outside every clone.
+WT_HOME=${WT_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/wt}
+
+# Subpaths of the checkout that must NOT be captured in snapshots. Each is its own ZFS child
+# dataset — never snapshotted, so absent from clones — and is bind-mounted through from the
+# canonical checkout, so every sandbox shares one live copy on the host. Space-separated,
+# relative to WT_CANONICAL.
+WT_SNAPSHOT_EXCLUDE=${WT_SNAPSHOT_EXCLUDE:-}
+
+# ZFS user property stamped on every snapshot wt takes. `wt gc`/`wt list` reap ONLY snapshots
+# carrying it, so a hand-made @wt-* snapshot is never destroyed on the strength of its name.
+WT_ZFS_PROP=${WT_ZFS_PROP:-com.wt:managed}
+
+# uid/gid the sandbox command runs as. wt needs root only to mount the clone, never to run
+# your shell. Defaults to whoever invoked wt — but pin it in config if wt is ever invoked as
+# root (`wt ssh-serve` is), since `id -u` would then be 0.
+WT_TARGET_UID=${WT_TARGET_UID:-$(id -u)}
+WT_TARGET_GID=${WT_TARGET_GID:-$(id -g)}
+WT_TARGET_USER=${WT_TARGET_USER:-$(id -nu "$WT_TARGET_UID" 2>/dev/null || echo "$WT_TARGET_UID")}
+
+# ns-local hold paths: bind targets that keep main's live .git and the excluded subpaths
+# reachable after the clone is mounted over WT_CANONICAL (see wt-setup.sh).
+WT_GIT_HOLD=${WT_GIT_HOLD:-/tmp/wt-git-main}
+WT_HOLD_DIR=${WT_HOLD_DIR:-/tmp/wt-holds}
+
+# ---- session hooks (see header) ----------------------------------------------------------
+# wt ships with NO hooks: it has no opinion about what a sandbox should run. The consuming
+# project supplies them from its config file.
+WT_HOOK_ENTER=${WT_HOOK_ENTER:-}
+WT_HOOK_TEARDOWN=${WT_HOOK_TEARDOWN:-}
+
+# ---- optional ssh transport (see wt-ssh) -------------------------------------------------
+WT_SSH_DIR=${WT_SSH_DIR:-$HOME/.wt-ssh}            # inetd sshd config + authorized_keys
+WT_SSH_PROXY=${WT_SSH_PROXY:-.wt/wt-ssh}           # ProxyCommand path, relative to the checkout
+WT_REMOTE_BIN=${WT_REMOTE_BIN:-/usr/local/bin/wt}  # wt's path inside the container
+
+# Commands that touch datasets need a real config; `wt help` does not.
+require_config() {
+  [ -n "$WT_CANONICAL" ] || die "WT_CANONICAL is not set (config: ${WT_CONFIG:-none found}) — see wt.conf.example"
+  [ -n "$WT_DS_SRC" ]    || die "WT_DS_SRC is not set (config: ${WT_CONFIG:-none found}) — see wt.conf.example"
+  [ -n "$WT_DS_PARENT" ] || die "WT_DS_PARENT is not set (config: ${WT_CONFIG:-none found}) — see wt.conf.example"
+}
+
+# Remove a path only if it's under WT_HOME (defends against empty/typo vars).
+safe_rmrf() {
+  local p=${1:-}
+  [ -n "$p" ] || die "safe_rmrf: empty path"
+  case "$p" in "$WT_HOME"/*) : ;; *) die "safe_rmrf: refusing path outside $WT_HOME: $p" ;; esac
+  chmod -R u+rwx -- "$p" 2>/dev/null || true
+  rm -rf -- "$p"
+}
+
+# A leading dash would survive as a dataset component ZFS rejects, aborting `wt new` after the
+# snapshot and worktree already exist and leaving both to be cleaned up by hand.
+validate_name() { case "${1:-}" in ''|-*|*[!a-zA-Z0-9_-]*) die "invalid sandbox name: '${1:-}'";; esac; }
+
+# Flatten an excluded subpath ("build/logs") into a single hold-dir component ("build_logs").
+# wt-setup.sh derives the identical name — keep the two in sync.
+exclude_key() { printf '%s' "${1//\//_}"; }
+
+# --- session liveness ---------------------------------------------------------------------
+# $WT_HOME lives on persistent storage and the EXIT trap never runs on SIGKILL
+# (OOM kill, `docker kill`, host crash), so a marker file's existence proves nothing. A session
+# is live only while its creator still holds an exclusive flock on the marker; the lock dies
+# with the process, whatever kills it. sudo closes fds >= 3, so no descendant inherits it.
+WT_LOCK_DIR=$WT_HOME/locks
+
+# Serialize new/rm/enter for one sandbox, so `wt rm` can't sample "not in use" in the window
+# before a concurrent `wt enter` has published its marker.
+lock_name() {
+  mkdir -p "$WT_LOCK_DIR"
+  exec 8>"$WT_LOCK_DIR/$1.lock"
+  flock -w 60 8 || die "timed out waiting for another wt command on '$1'"
+}
+unlock_name() { exec 8>&-; }
+
+marker_live() { [ -e "$1" ] && ! flock -n "$1" true 2>/dev/null; }
+
+name_active() {
+  local m
+  for m in "$WT_HOME"/active/"$1".*; do
+    marker_live "$m" && return 0
+  done
+  return 1
+}
+
+# Drop markers whose session is gone. Callers hold the sandbox's name lock, so this cannot
+# race a session that has created its marker but not yet locked it.
+prune_stale_markers() {
+  local m
+  for m in "$WT_HOME"/active/"$1".*; do
+    [ -e "$m" ] || continue
+    marker_live "$m" || { log "pruning stale session marker ${m##*/}"; rm -f -- "$m"; }
+  done
+}
+
+# Release a sandbox's per-session resources by firing the teardown hook (host-side). Whatever
+# daemons the enter hook started, the teardown hook stops; wt does not know what they are. The
+# contract is best-effort and idempotent — this may be called when nothing is running, and a
+# missing or failing hook must never fail the wt operation that called it.
+run_teardown_hook() {
+  local n=$1
+  [ -n "${WT_HOOK_TEARDOWN:-}" ] || return 0
+  WT_SANDBOX="$n" bash -c "$WT_HOOK_TEARDOWN" >/dev/null 2>&1 || true
+}
+
+# Kill any process whose mount namespace still has $1 (a clone dataset) mounted — e.g. a
+# daemonized IDE server that outlived its ssh session — so `zfs destroy` isn't blocked.
+# Reading another namespace/owner's mountinfo needs root, hence sudo.
+kill_clone_holders() {
+  local clone=$1 p
+  for p in /proc/[0-9]*; do
+    p=${p#/proc/}
+    if sudo grep -qF "$clone " "/proc/$p/mountinfo" 2>/dev/null; then
+      log "killing lingering holder pid $p (clone $clone still mounted)"
+      sudo kill -TERM "$p" 2>/dev/null || true
+    fi
+  done
+}
+
+tree=""; meta=""
+set_paths() { tree=$WT_HOME/trees/$1; meta=$WT_HOME/meta/$1; }
+
+git_common_dir_abs() { ( cd "$WT_CANONICAL" && realpath "$(git rev-parse --git-common-dir)" ); }
+
+require_zfs() {
+  command -v zfs >/dev/null 2>&1 \
+    || die "zfs CLI not found — rebuild the devcontainer to pick up zfsutils-linux"
+  zfs list -H -o name "$WT_DS_SRC" >/dev/null 2>&1 \
+    || die "$WT_DS_SRC missing — run .devcontainer/worktree/host-zfs-setup.sh on the host"
+  zfs list -H -o name "$WT_DS_PARENT" >/dev/null 2>&1 \
+    || die "$WT_DS_PARENT missing — run .devcontainer/worktree/host-zfs-setup.sh on the host"
+}
+
+# ---- subcommands ------------------------------------------------------------------------
+wt_new() {
+  local name=${1:?usage: wt new <name> [ref]} ref=${2:-HEAD}
+  require_config; validate_name "$name"; set_paths "$name"; require_zfs
+
+  mkdir -p "$WT_HOME"/{trees,meta,active}
+  # Two `wt new <same-name>` would otherwise both pass the existence checks and collide on the
+  # snapshot name, leaving a half-registered worktree behind.
+  lock_name "$name"
+  [ -e "$tree" ] && die "sandbox '$name' already exists"
+  zfs list -H -o name "$WT_DS_PARENT/$name" >/dev/null 2>&1 \
+    && die "ZFS clone $WT_DS_PARENT/$name already exists (run 'wt rm $name' or 'wt gc')"
+
+  # 1. Warn (don't refuse) if main is dirty — the snapshot captures the dirty working tree
+  #    while the wt branch HEAD points at $ref, so `git status` in the sandbox will surface
+  #    main's uncommitted changes as the sandbox's diff. Useful sometimes, surprising other
+  #    times; calling it out makes the behavior visible.
+  local dirty count
+  dirty=$(git -C "$WT_CANONICAL" status --porcelain 2>/dev/null || true)
+  if [ -n "$dirty" ]; then
+    count=$(printf '%s\n' "$dirty" | wc -l)
+    log "main is dirty ($count uncommitted file(s)); sandbox '$name' will inherit them as working-tree diff:"
+    printf '%s\n' "$dirty" | head -5 | sed 's/^/  /' >&2
+    [ "$count" -gt 5 ] && echo "  ... and $((count-5)) more" >&2
+  fi
+
+  # 2. Register the worktree FIRST so HEAD == snapshot's tree state by construction. Resolve
+  #    $ref to a SHA up front: if main happens to git-checkout to a different branch between
+  #    here and the snapshot, both the worktree HEAD and the snapshot will still correspond
+  #    to the same commit. --no-checkout writes no source files (the clone provides them);
+  #    git writes only the placeholder $tree/.git pointer + main-side bookkeeping at
+  #    $main/.git/worktrees/<name>/. That bookkeeping lives inside the source dataset and is
+  #    captured by the snapshot below — masked in-NS by the bind to main's live .git, see
+  #    wt-setup.sh.
+  local ref_sha src_commit
+  ref_sha=$(git -C "$WT_CANONICAL" rev-parse --verify "$ref^{commit}") \
+    || die "could not resolve ref '$ref'"
+  src_commit=$(git -C "$WT_CANONICAL" rev-parse --verify HEAD)
+  mkdir -p "$tree"
+  git -C "$WT_CANONICAL" worktree add --no-checkout -b "wt/$name" "$tree" "$ref_sha"
+
+  #    Populate the worktree's index to match the ref. git judges cleanliness by comparing the
+  #    working tree to the INDEX (then index to HEAD); `--no-checkout` leaves the index empty,
+  #    so without this every file the clone provides reads as a staged deletion AND untracked.
+  #    read-tree writes only the index — no working files, which the clone supplies. Done only
+  #    when the ref is main's current checkout; a different ref holds different files than the
+  #    snapshot and is materialized in-sandbox on first enter (wt-setup.sh), where the writable
+  #    clone is mounted.
+  if [ "$ref_sha" = "$src_commit" ]; then
+    git -C "$tree" read-tree "$ref_sha"
+  fi
+
+  # 3. Snapshot the source dataset (parent only — the WT_SNAPSHOT_EXCLUDE children are left
+  #    out by the absence of -r, which is exactly why they never appear in a clone).
+  #    $WT_ZFS_PROP=1 is wt's provenance marker: `wt gc`/`wt list` filter on it so only
+  #    wt-created snapshots are ever auto-reaped — a hand-made @wt-* snapshot won't match.
+  local snap="$WT_DS_SRC@wt-$name-$(date +%Y%m%d-%H%M%S)"
+  zfs snapshot -o "$WT_ZFS_PROP=1" "$snap"
+
+  # 4. Clone the snapshot. mountpoint=legacy so we control the mount lifecycle (mount only
+  #    inside the sandbox namespace); canmount=noauto so a stray `zfs mount -a` won't mount.
+  zfs clone -o mountpoint=legacy -o canmount=noauto "$snap" "$WT_DS_PARENT/$name"
+
+  # 5. Per-sandbox metadata. The .git pointer file is used by wt-setup.sh to replace the
+  #    snapshot-frozen .git directory in the clone (which is otherwise inert).
+  mkdir -p "$meta"
+  echo "$snap"               > "$meta/snapshot"
+  echo "$WT_DS_PARENT/$name" > "$meta/clone"
+  # Baseline commit the snapshot's files correspond to, and the branch HEAD the sandbox should
+  # land on. wt-setup.sh uses them to materialize a non-HEAD ref into the clone on first enter.
+  echo "$src_commit"         > "$meta/src_commit"
+  echo "$ref_sha"            > "$meta/ref_sha"
+  printf 'gitdir: %s/worktrees/%s\n' "$WT_GIT_HOLD" "$name" > "$meta/dot_git"
+  printf '%s/.git\n'                 "$WT_CANONICAL" > "$meta/gitdir_backptr"
+
+  log "created sandbox '$name' (branch wt/$name @ $ref_sha, clone $WT_DS_PARENT/$name)"
+}
+
+wt_enter() {
+  local name=${1:?usage: wt enter <name> [-- cmd...]}; shift || true
+  require_config; validate_name "$name"; set_paths "$name"
+  [ "${1:-}" = -- ] && shift || true
+
+  local -a cmd=( "$@" ); [ ${#cmd[@]} -eq 0 ] && cmd=( bash )
+  # Hold paths for the excluded subpaths are made here (as the user) rather than in-NS, so
+  # they exist on the host before the mount namespace is unshared.
+  mkdir -p "$WT_HOME/active" "$WT_GIT_HOLD" "$WT_HOLD_DIR"
+  local _sub
+  for _sub in $WT_SNAPSHOT_EXCLUDE; do mkdir -p "$WT_HOLD_DIR/$(exclude_key "$_sub")"; done
+
+  # Publish this session before releasing the lock: a `wt rm` that starts now blocks here,
+  # then sees a live marker, rather than destroying the clone this session is about to mount.
+  lock_name "$name"
+  prune_stale_markers "$name"
+  [ -d "$tree" ] || { unlock_name; die "no sandbox '$name' — run 'wt new $name'"; }
+  local clone; clone=$(cat "$meta/clone" 2>/dev/null) \
+    || { unlock_name; die "sandbox '$name' has no clone recorded"; }
+  zfs list -H -o name "$clone" >/dev/null 2>&1 \
+    || { unlock_name; die "ZFS clone '$clone' missing — sandbox state is corrupt; 'wt rm $name' then recreate"; }
+
+  local active="$WT_HOME/active/$name.$$"
+  exec 9>"$active"
+  flock -n 9 || die "internal: fresh session marker $active is already locked"
+  unlock_name
+
+  # On exit drop our active marker; if we were the LAST session for this name, fire the
+  # teardown hook — the daemons the enter hook started otherwise pin the clone's mount
+  # namespace indefinitely (a compiler-cache server typically has no idle-timeout), and a pinned clone
+  # cannot be destroyed. The hook is idempotent, so a simultaneous last-exit double-call is
+  # harmless. Concurrent sessions hold their own marker locks, so name_active stays true and
+  # only the final exit triggers it. fd 9 keeps this session's marker locked meanwhile.
+  trap "rm -f -- '$active'; name_active '$name' || run_teardown_hook '$name'" EXIT
+
+  # Everything wt-setup.sh needs, across the `sudo -E` boundary. WT_HOOK_ENTER rides along so
+  # setup can fire it after the privilege drop. Nothing here is language- or project-specific:
+  # a consuming project injects its own session env (cargo jobs, caches, ...) via that hook.
+  # WT_PATH carries our PATH across sudo, whose secure_path would otherwise strip the caller's
+  # toolchains even under -E; wt has no idea what is on it, wt-setup.sh just puts it back.
+  export WT_CANONICAL WT_SRC_CLONE="$clone" WT_META="$meta" \
+         WT_GIT_HOLD WT_GIT_REAL="$(git_common_dir_abs)" \
+         WT_HOLD_DIR WT_SNAPSHOT_EXCLUDE WT_TARGET_UID WT_TARGET_GID \
+         WT_SANDBOX="$name" WT_HOOK_ENTER WT_PATH="$PATH" \
+         WT_SRC_COMMIT="$(cat "$meta/src_commit" 2>/dev/null || true)" \
+         WT_REF_SHA="$(cat "$meta/ref_sha" 2>/dev/null || true)"
+
+  # `mount -t zfs` of a delegated dataset needs REAL CAP_SYS_ADMIN — userns CAP_SYS_ADMIN
+  # isn't enough (the ZFS module rejects the mount from a non-init userns even with
+  # `zfs allow mount`). So enter the mountns via sudo (NOPASSWD for the invoking user), do mounts as root,
+  # then nested userns drop to uid 1000. The mountns dies with this process tree, so the
+  # ZFS mount auto-cleans on exit.
+  # 9>&- keeps the session-marker lock out of the sandbox: whatever the enter hook starts daemonizes
+  # in there, and an inherited fd would pin the marker as "live" long after the session ended.
+  sudo -E unshare --mount --propagation private -- \
+    "$SELF_DIR/wt-setup.sh" "$name" -- "${cmd[@]}" 9>&-
+}
+
+wt_claude() { local name=${1:?usage: wt claude <name> [args...]}; shift || true; wt_enter "$name" claude "$@"; }
+
+wt_list() {
+  require_config
+  [ -d "$WT_HOME/trees" ] || { echo "(no sandboxes)"; return 0; }
+  local d name br act f used here orphans untagged s sn tag; set +e
+  here=${WT_SANDBOX:-}
+  # Header.
+  printf '%-2s %-16s  %-22s  %-10s  %s\n' '*' 'NAME' 'BRANCH' 'USED' 'ACTIVE'
+  for d in "$WT_HOME"/trees/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    br="wt/$name"   # deterministic by construction; avoids a git lookup that fails inside a sandbox
+    used=$(zfs get -H -o value used "$WT_DS_PARENT/$name" 2>/dev/null); [ -n "$used" ] || used='?'
+    # Count sessions, not marker files: a SIGKILLed session leaves its marker behind.
+    act=0; for f in "$WT_HOME"/active/"$name".*; do marker_live "$f" && act=$((act+1)); done
+    # '*' marks the sandbox you are currently inside.
+    printf '%-2s %-16s  %-22s  %-10s  %s\n' \
+      "$([ "$name" = "$here" ] && echo '*' || echo ' ')" \
+      "$name" "$br" "$used" "$([ "$act" -gt 0 ] && echo "yes ($act)" || echo '-')"
+  done
+  set -e
+  # Surface orphan @wt-* snapshots that don't match a current sandbox tree. Split by provenance:
+  # only wt-tagged ($WT_ZFS_PROP=1) ones are gc's to reclaim; untagged @wt-* snapshots gc
+  # leaves alone, so list them separately or they'd silently pile up unnoticed.
+  orphans=; untagged=
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    sn=${s#*@wt-}; sn=${sn%-*-*}        # strip trailing -YYYYMMDD-HHMMSS
+    [ -d "$WT_HOME/trees/$sn" ] && continue
+    tag=$(zfs get -H -o value "$WT_ZFS_PROP" "$s" 2>/dev/null)
+    if [ "$tag" = 1 ]; then orphans+="$s"$'\n'; else untagged+="$s"$'\n'; fi
+  done < <(zfs list -H -o name -t snapshot "$WT_DS_SRC" 2>/dev/null | grep -E '@wt-' || true)
+  if [ -n "$orphans" ]; then
+    echo
+    echo "orphan snapshots (run 'wt gc' to reclaim):"
+    printf '  %s\n' "$orphans" | sed '/^  $/d'
+  fi
+  if [ -n "$untagged" ]; then
+    echo
+    echo "untagged @wt-* snapshots (not wt-managed — reap by hand):"
+    printf '  %s\n' "$untagged" | sed '/^  $/d'
+  fi
+  return 0
+}
+
+wt_gc() {
+  require_config
+  command -v zfs >/dev/null 2>&1 || return 0
+  # Everything below destroys children of $WT_DS_PARENT. Pointed at the source dataset it would
+  # reach the WT_SNAPSHOT_EXCLUDE children, which every sandbox bind-mounts live.
+  [ "$WT_DS_PARENT" != "$WT_DS_SRC" ] \
+    || die "WT_DS_PARENT must not be the source dataset ($WT_DS_SRC)"
+
+  # 0. Stale session markers: a SIGKILLed session leaves one behind, and `wt rm` refuses while
+  #    any marker exists. Nothing else ever reaps them.
+  local m n
+  for m in "$WT_HOME"/active/*; do
+    [ -e "$m" ] || continue
+    n=${m##*/}; n=${n%.*}
+    case "$n" in ''|-*|*[!a-zA-Z0-9_-]*) continue ;; esac
+    lock_name "$n"; prune_stale_markers "$n"; unlock_name
+  done
+
+  # 1. Orphan clones: children of $WT_DS_PARENT whose $WT_HOME/trees/<name> is gone.
+  local clone bn
+  while IFS= read -r clone; do
+    [ -n "$clone" ] || continue
+    bn=${clone##*/}
+    if [ ! -d "$WT_HOME/trees/$bn" ]; then
+      run_teardown_hook "$bn"   # release the clone mount a leftover session daemon would pin
+      log "gc: destroying orphan clone $clone"
+      zfs destroy "$clone" 2>/dev/null || log "  (failed; still mounted?)"
+    fi
+  done < <(zfs list -H -o name -r "$WT_DS_PARENT" 2>/dev/null | tail -n +2)
+  # 2. Orphan snapshots: @wt-* on $WT_DS_SRC that wt created ($WT_ZFS_PROP=1) and that no
+  #    clone references. Both conditions are required — an untagged @wt-* snapshot (hand-made,
+  #    or from another tool) is left alone, since the name glob alone can't prove wt made it.
+  local snap tag clones_of
+  while IFS= read -r snap; do
+    [ -n "$snap" ] || continue
+    tag=$(zfs get -H -o value "$WT_ZFS_PROP" "$snap" 2>/dev/null)
+    if [ "$tag" != 1 ]; then
+      log "gc: skipping untagged snapshot $snap (not wt-managed)"
+      continue
+    fi
+    clones_of=$(zfs get -H -o value clones "$snap" 2>/dev/null)
+    if [ -z "$clones_of" ] || [ "$clones_of" = '-' ]; then
+      log "gc: destroying orphan snapshot $snap"
+      zfs destroy "$snap" 2>/dev/null || log "  (failed)"
+    fi
+  done < <(zfs list -H -o name -t snapshot "$WT_DS_SRC" 2>/dev/null | grep -E '@wt-' || true)
+}
+
+wt_rm() {
+  local name=${1:?usage: wt rm <name>}; require_config; validate_name "$name"; set_paths "$name"
+  # Held for the whole removal: a `wt enter` racing us blocks, then finds the tree gone.
+  lock_name "$name"
+  prune_stale_markers "$name"
+  name_active "$name" && die "sandbox '$name' is in use; exit it first"
+
+  local clone snap
+  clone=$(cat "$meta/clone" 2>/dev/null || true)
+  snap=$(cat "$meta/snapshot" 2>/dev/null || true)
+
+  [ -d "$tree" ] && { git -C "$WT_CANONICAL" worktree remove --force "$tree" 2>/dev/null || true; }
+  safe_rmrf "$meta"; safe_rmrf "$tree"
+  git -C "$WT_CANONICAL" worktree prune 2>/dev/null || true
+  # Preserve unmerged work: rename the branch to a predictable, deconflicted archive
+  # instead of deleting it (the worktree was removed just above, so the branch is free).
+  if git -C "$WT_CANONICAL" show-ref --verify --quiet "refs/heads/wt/$name"; then
+    local archive="wt-archive/$name"
+    if git -C "$WT_CANONICAL" show-ref --verify --quiet "refs/heads/$archive"; then
+      archive="wt-archive/$name-$(date +%Y%m%d-%H%M%S)"
+    fi
+    if git -C "$WT_CANONICAL" branch -m "wt/$name" "$archive" 2>/dev/null; then
+      log "archived branch wt/$name -> $archive (delete it manually when the work is safe)"
+    else
+      log "could not archive branch wt/$name; left in place"
+    fi
+  fi
+
+  # A lingering session daemon keeps the clone mounted (see run_teardown_hook); stop it so the
+  # destroy below isn't blocked by a busy dataset. The teardown is signal-based and the kernel
+  # takes a moment to reap the mount namespace, so we retry the destroy a few times if it fails.
+  run_teardown_hook "$name"
+
+  # Destroy clone first (snapshot has the clone as a dependency). After the sandbox's
+  # mount namespace is torn down, ZFS takes a few seconds to release its internal hold on
+  # the dataset (the namespace death is async wrt zfs destroy). Retry for ~15s before
+  # giving up — this is invisible to the user when there's no race.
+  if [ -n "$clone" ] && zfs list -H -o name "$clone" >/dev/null 2>&1; then
+    local attempt=0 killed=0
+    while ! zfs destroy "$clone" 2>/dev/null; do
+      attempt=$((attempt + 1))
+      # After a few seconds of a busy clone, a process is pinning it — kill holders once.
+      if [ "$killed" -eq 0 ] && [ "$attempt" -ge 6 ]; then
+        kill_clone_holders "$clone"; killed=1
+      fi
+      if [ "$attempt" -ge 30 ]; then
+        zfs destroy "$clone" || die "zfs destroy $clone failed after 30 retries (still mounted? promoted?)"
+        break
+      fi
+      sleep 0.5
+    done
+  fi
+  if [ -n "$snap" ] && zfs list -H -o name -t snapshot "$snap" >/dev/null 2>&1; then
+    zfs destroy "$snap" 2>/dev/null || log "snap $snap still referenced; left in place"
+  fi
+
+  log "removed sandbox '$name'"
+}
+
+wt_status() {
+  [ -n "${WT_SANDBOX:-}" ] && echo "current       : $WT_SANDBOX  (you are inside this sandbox)"
+  echo "config        : ${WT_CONFIG:-none found (using built-in defaults)}"
+  echo "canonical     : ${WT_CANONICAL:-UNSET}"
+  echo "sandboxes     : $WT_HOME"
+  echo "src dataset   : ${WT_DS_SRC:-UNSET}"
+  echo "wt dataset    : ${WT_DS_PARENT:-UNSET}"
+  echo "target uid/gid: $WT_TARGET_UID:$WT_TARGET_GID"
+  echo "zfs property  : $WT_ZFS_PROP"
+  echo "excluded      : ${WT_SNAPSHOT_EXCLUDE:-none}"
+  echo "enter hook    : ${WT_HOOK_ENTER:-none}"
+  echo "teardown hook : ${WT_HOOK_TEARDOWN:-none}"
+  if command -v zfs >/dev/null 2>&1 && [ -n "$WT_DS_SRC" ] && [ -n "$WT_DS_PARENT" ]; then
+    local src_ok parent_ok sub
+    zfs list -H -o name "$WT_DS_SRC" >/dev/null 2>&1 && src_ok=yes || src_ok='MISSING (host setup not run?)'
+    zfs list -H -o name "$WT_DS_PARENT" >/dev/null 2>&1 && parent_ok=yes || parent_ok='MISSING (host setup not run?)'
+    echo "src ds        : $src_ok"
+    echo "wt ds         : $parent_ok"
+    for sub in $WT_SNAPSHOT_EXCLUDE; do
+      zfs list -H -o name "$WT_DS_SRC/$sub" >/dev/null 2>&1 \
+        && echo "excl ds       : $WT_DS_SRC/$sub  yes" \
+        || echo "excl ds       : $WT_DS_SRC/$sub  MISSING"
+    done
+  elif ! command -v zfs >/dev/null 2>&1; then
+    echo "zfs CLI       : NOT INSTALLED"
+  fi
+  ls "$WT_HOME"/active/* >/dev/null 2>&1 \
+    && echo "active        : $(ls "$WT_HOME"/active/ 2>/dev/null | tr '\n' ' ')" \
+    || echo "active        : none"
+}
+
+wt_ssh_config() {
+  local repo="${1:-LOCAL_REPO}"   # this checkout's path on your local machine; the container can't know it
+  local d name
+  echo "# --- wt-ssh: paste into ~/.ssh/config on your local machine ---"
+  [ "$repo" = LOCAL_REPO ] && \
+    echo "# Replace LOCAL_REPO with this checkout's path on your local machine (the source of $WT_CANONICAL)."
+  for d in "$WT_HOME"/trees/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    printf '\nHost wt-%s\n  User %s\n  ProxyCommand %s/%s proxy %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' \
+      "$name" "$WT_TARGET_USER" "$repo" "$WT_SSH_PROXY" "$name"
+  done
+}
+
+wt_ssh_setup() {
+  mkdir -p "$WT_SSH_DIR"; chmod 700 "$WT_SSH_DIR"
+  sudo mkdir -p /run/sshd && sudo chmod 0755 /run/sshd   # sshd privsep dir (lost on container restart)
+
+  cat > "$WT_SSH_DIR/sshd_config" <<EOF
+# Generated by 'wt ssh-setup'. Inetd-mode config for wt-ssh (see wt ssh-serve).
+HostKey /etc/ssh/ssh_host_ed25519_key
+UsePAM yes
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AllowUsers $WT_TARGET_USER
+AuthorizedKeysFile $WT_SSH_DIR/authorized_keys
+AcceptEnv WT_SANDBOX
+ForceCommand $WT_REMOTE_BIN ssh-forced
+PermitTTY yes
+LogLevel INFO
+EOF
+
+  # Authorize the already-forwarded agent key(s) plus any local pubkeys (spec §Auth: docker
+  # access already implies container control, so this is protocol necessity, not a new secret).
+  # Staged in a temp file and moved into place only once it holds a key. postStartCommand runs
+  # `wt ssh-setup || true` on every container start, and a start that beats the host's agent
+  # proxy (see .devcontainer/prepare-host-state.sh) finds an empty `ssh-add -L`; overwriting
+  # authorized_keys in place would lock wt-ssh out with nothing but a swallowed exit code.
+  local keys="$WT_SSH_DIR/authorized_keys.new"
+  { ssh-add -L 2>/dev/null; cat "$HOME"/.ssh/*.pub 2>/dev/null; } \
+    | grep -E '^(ssh-|ecdsa-|sk-)' | sort -u > "$keys" || true
+  if [ ! -s "$keys" ]; then
+    rm -f "$keys"
+    die "no public keys found (agent empty and no $HOME/.ssh/*.pub) — add a key and re-run"
+  fi
+  chmod 600 "$keys"
+  mv -f "$keys" "$WT_SSH_DIR/authorized_keys"
+
+  sudo /usr/sbin/sshd -t -f "$WT_SSH_DIR/sshd_config" \
+    || die "generated sshd_config failed 'sshd -t' validation"
+
+  log "wt-ssh ready: $(grep -c . "$WT_SSH_DIR/authorized_keys") key(s) authorized in $WT_SSH_DIR"
+  log "on your local machine run '<checkout>/.devcontainer/worktree/wt-ssh config' and paste the output into ~/.ssh/config"
+}
+
+# Runs as ROOT (invoked over `docker exec -u0`). Inetd sshd needs real privileges to read
+# the host key, do privsep, and setuid to the target user. Delivers the sandbox name via -o SetEnv; the
+# ForceCommand (wt ssh-forced) reads it. Validates the sandbox up front for a clean error.
+wt_ssh_serve() {
+  local name=${1:?usage: wt ssh-serve <name>}; validate_name "$name"; set_paths "$name"
+  [ -d "$tree" ] || die "no sandbox '$name' — run 'wt new $name'"
+  exec /usr/sbin/sshd -i -e -o "SetEnv=WT_SANDBOX=$name" -f "$WT_SSH_DIR/sshd_config"
+}
+
+# sshd ForceCommand target — runs as the target user after auth. Enters the sandbox namespace and runs the
+# client's command (a single string from SSH) under a login shell, preserving quoting/env.
+wt_ssh_forced() {
+  : "${WT_SANDBOX:?WT_SANDBOX unset (wt ssh-serve must pass -o SetEnv=WT_SANDBOX)}"
+  validate_name "$WT_SANDBOX"
+  export SSH_AUTH_SOCK=/ssh-agent/agent.sock          # forwarded host agent, for outbound git/ssh
+  wt_enter "$WT_SANDBOX" -- bash -lc "${SSH_ORIGINAL_COMMAND:-exec bash -l}"
+}
+
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; }
+
+# Sourcing wt (test/test-hooks-unit.sh) defines its functions without dispatching a command.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  new)       wt_new "$@" ;;
+  enter)     wt_enter "$@" ;;
+  claude)    wt_claude "$@" ;;
+  list)      wt_list "$@" ;;
+  rm)        wt_rm "$@" ;;
+  gc)        wt_gc "$@" ;;
+  status)    wt_status "$@" ;;
+  ssh-config) wt_ssh_config "$@" ;;
+  ssh-setup)  wt_ssh_setup "$@" ;;
+  ssh-serve)  wt_ssh_serve "$@" ;;
+  ssh-forced) wt_ssh_forced "$@" ;;
+  ''|help|-h|--help) usage ;;
+  *) die "unknown command '$cmd' (try 'wt help')" ;;
+esac

@@ -1,0 +1,164 @@
+# wt.conf.example — every variable `wt` reads, with its real default.
+#
+# Copy to ~/.config/wt/config (or /etc/wt/config), or keep it in your project and point
+# $WT_CONFIG at it. wt searches, in order:
+#
+#     $WT_CONFIG                     (a file path; WT_CONFIG= — empty — skips the file entirely)
+#     $XDG_CONFIG_HOME/wt/config     (default ~/.config/wt/config)
+#     /etc/wt/config
+#
+# The file is SOURCED as shell, so it may compute values. The ENVIRONMENT still wins over
+# anything set here — that is how a one-off override (or a test) reaches in without editing the
+# file. host-zfs-setup.sh reads this same file, the same way.
+#
+# A project usually keeps its config inside the checkout (so it is reviewed and versioned with
+# the code) and maps it to /etc/wt/config in the dev image.
+
+# ---- REQUIRED -----------------------------------------------------------------------------
+# There is no sensible default for these three; every dataset command dies without them.
+
+# The checkout wt clones — the path as the process running wt sees it. A per-sandbox clone is
+# mounted over exactly this path inside the sandbox's mount namespace, which is what keeps
+# mtimes and absolute paths consistent and your build system warm.
+#
+# In a devcontainer this is the CONTAINER's path (/workspaces/myrepo), not the host's. When you
+# run host-zfs-setup.sh on the host, pass the host path to it as an argument.
+WT_CANONICAL=/workspaces/myrepo
+
+# The ZFS dataset holding that checkout, and the dataset the per-sandbox clones hang under.
+# Both are created by host-zfs-setup.sh. WT_DS_PARENT must not live under WT_DS_SRC: `wt gc`
+# destroys children of WT_DS_PARENT, and inside WT_DS_SRC those children are your live data.
+WT_DS_SRC=rpool/data/myrepo-src
+WT_DS_PARENT=rpool/data/myrepo-wt
+
+# ---- sandbox state ------------------------------------------------------------------------
+# Where wt keeps trees/, meta/, active/ and locks/. It must be on the HOST side — outside every
+# clone — or a sandbox's own bookkeeping would be inside the thing being destroyed. Point it at
+# something backed by WT_DS_PARENT's mountpoint.
+#
+# Default: ${XDG_DATA_HOME:-$HOME/.local/share}/wt
+#WT_HOME=$HOME/myrepo-wt
+
+# ---- never-snapshotted subpaths -----------------------------------------------------------
+# Space-separated subpaths, relative to WT_CANONICAL, that must NEVER be captured in a snapshot
+# — huge, churny, or shared-by-design directories (logs, datasets, caches you want to stay
+# common across sandboxes).
+#
+# The mechanism: host-zfs-setup.sh makes each entry its own ZFS child dataset
+# ($WT_DS_SRC/<sub>). `wt new` snapshots WT_DS_SRC NON-recursively, so a child dataset is simply
+# not in the snapshot — and therefore not in the clone, where it appears as an empty mountpoint
+# directory. wt-setup.sh then bind-mounts the canonical copy back over that empty directory, so
+# every sandbox sees ONE live shared copy on the host, and no sandbox pays to duplicate it.
+#
+# Consequences worth knowing before you add one:
+#   * it is shared, not copied — a sandbox writing there writes the real thing, for everyone;
+#   * changing this list later means running host-zfs-setup.sh again (it will move an existing
+#     directory's content into the new child dataset for you);
+#   * use TOP-LEVEL directories. A nested entry (build/logs) would force build/ to be a dataset
+#     too, and then everything under build/ — not just build/logs — would be absent from every
+#     sandbox. host-zfs-setup.sh refuses to do that silently.
+#
+# Default: empty (nothing excluded).
+#WT_SNAPSHOT_EXCLUDE=logs
+
+# ---- identity -----------------------------------------------------------------------------
+# The unprivileged user a sandbox command runs as. wt needs root only to mount the clone, never
+# to run your shell.
+#
+# PIN these if wt is ever invoked as root — `wt ssh-serve` is, over `docker exec -u0`, and the
+# defaults would then compute a target uid of 0. The uid is also what host-zfs-setup.sh
+# delegates the ZFS permissions to, and it must match on both sides of the container boundary
+# (bind mounts preserve uids, not names).
+#
+# Defaults: $(id -u) / $(id -g) / the name of that uid.
+#WT_TARGET_UID=1000
+#WT_TARGET_GID=1000
+#WT_TARGET_USER=dev
+
+# ---- provenance ---------------------------------------------------------------------------
+# ZFS user property stamped on every snapshot wt takes. `wt gc` and `wt list` reap ONLY snapshots
+# that carry it, so a hand-made @wt-* snapshot is never destroyed on the strength of its name.
+# Changing it later strands existing snapshots as "untagged": they stop being gc's business and
+# have to be reaped by hand.
+#
+# Default: com.wt:managed
+#WT_ZFS_PROP=com.wt:managed
+
+# ---- namespace hold paths -----------------------------------------------------------------
+# Bind targets, inside the sandbox's mount namespace, that keep main's live .git and each
+# WT_SNAPSHOT_EXCLUDE subpath reachable after the clone is mounted over WT_CANONICAL. You only
+# need to set these to namespace them against another wt install on the same host.
+#
+# Defaults: /tmp/wt-git-main and /tmp/wt-holds
+#WT_GIT_HOLD=/tmp/myrepo-git-main
+#WT_HOLD_DIR=/tmp/myrepo-wt-holds
+
+# ---- session hooks ------------------------------------------------------------------------
+# wt ships with NO hooks and has no opinion about what a sandbox should run — no language, no
+# toolchain, no daemon, no cache. Everything project-specific happens here. Each is a COMMAND
+# STRING, run with `bash -c`, so it can be a script plus arguments.
+#
+# WT_HOOK_ENTER — runs INSIDE the sandbox namespace, as WT_TARGET_UID, once per `wt enter`,
+#   after the mounts are up and before your command is exec'd.
+#     env in : WT_SANDBOX (the sandbox name), WT_CANONICAL (here: this sandbox's clone),
+#              WT_SRC_CLONE, WT_META, WT_SNAPSHOT_EXCLUDE, WT_SRC_COMMIT, WT_REF_SHA.
+#     stdout : every well-formed KEY=VALUE line is exported into the session (direnv-style).
+#              stdout is therefore precious — redirect everything else to stderr or /dev/null.
+#     exit   : ran-then-failed is tolerated (the env it already printed still applies, so print
+#              env FIRST, before anything that can fail). Could-not-be-executed (126/127) ABORTS
+#              the session — a hook that silently doesn't run means the session quietly loses
+#              everything the hook guarantees, which is worse than not starting.
+#
+# WT_HOOK_TEARDOWN — runs HOST-side when a sandbox's resources must be released: the LAST
+#   session exiting, `wt rm`, and `wt gc` reaping an orphan.
+#     env in : WT_SANDBOX. Nothing else is guaranteed — `export` anything else it needs.
+#     exit   : ignored. Must be idempotent: it is called when nothing is running, and possibly
+#              more than once.
+#   It is not optional bookkeeping. Anything the enter hook left running in the namespace (a
+#   build daemon, a language server) pins the clone's mount and would otherwise block
+#   `zfs destroy`, so `wt rm` would fail on a sandbox that merely looks idle.
+#
+# A hook that gives each sandbox its own build-cache daemon instead of a shared one:
+#
+#     #!/bin/bash
+#     case "$1" in
+#       enter)
+#         echo "MYCACHE_SOCK=/tmp/mycache-$WT_SANDBOX.sock"     # session env, printed FIRST
+#         MYCACHE_SOCK=/tmp/mycache-$WT_SANDBOX.sock mycache start >/dev/null 2>&1 || true
+#         ;;
+#       teardown)
+#         MYCACHE_SOCK=/tmp/mycache-$WT_SANDBOX.sock mycache stop >/dev/null 2>&1 || true
+#         ;;
+#     esac
+#
+# Defaults: both empty (no hooks).
+#WT_HOOK_ENTER='/workspaces/myrepo/.devcontainer/wt-hook enter'
+#WT_HOOK_TEARDOWN='/workspaces/myrepo/.devcontainer/wt-hook teardown'
+
+# ---- optional ssh transport (only if you use wt-ssh) --------------------------------------
+# `wt-ssh` runs on your LOCAL machine and proxies an ssh session into a sandbox over
+# `docker exec` — no listening port. Core wt never calls docker; skip this whole section if you
+# do not use it.
+#
+# Because wt-ssh runs on the host, it cannot read the container's /etc/wt/config: it looks for
+# <checkout>/.wt.conf, then <checkout>/.config/wt.conf (override with $WT_SSH_CONFIG). Keeping
+# the config in the repo is what lets one file serve both sides.
+
+# Generated sshd config + authorized_keys, written by `wt ssh-setup` (inside the container).
+# Default: $HOME/.wt-ssh
+#WT_SSH_DIR=$HOME/.wt-ssh
+
+# Path to wt-ssh on your LOCAL machine, relative to the checkout — baked into the ProxyCommand
+# lines that `wt ssh-config` prints for your ~/.ssh/config.
+# Default: .wt/wt-ssh
+#WT_SSH_PROXY=.devcontainer/worktree/wt-ssh
+
+# Where wt is installed INSIDE the container (see install.sh). Used as the sshd ForceCommand and
+# by wt-ssh's `docker exec`.
+# Default: /usr/local/bin/wt
+#WT_REMOTE_BIN=/usr/local/bin/wt
+
+# ---- test seam ----------------------------------------------------------------------------
+# Not config: wt-setup.sh's privilege drop is a single overridable command (WT_DROP_PRIV), so an
+# unprivileged unit test can substitute a no-op. Setting it in a config file is a way to get
+# your sandboxes running as root by accident. Don't.
