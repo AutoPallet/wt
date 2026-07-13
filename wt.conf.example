@@ -101,19 +101,26 @@ WT_DS_PARENT=rpool/data/myrepo-wt
 # WT_HOOK_ENTER — runs INSIDE the sandbox namespace, as WT_TARGET_UID, once per `wt enter`,
 #   after the mounts are up and before your command is exec'd.
 #     env in : WT_SANDBOX (the sandbox name), WT_CANONICAL (here: this sandbox's clone),
-#              WT_SRC_CLONE, WT_META, WT_SNAPSHOT_EXCLUDE, WT_SRC_COMMIT, WT_REF_SHA.
-#     stdout : every well-formed KEY=VALUE line is exported into the session (direnv-style).
-#              stdout is therefore precious — redirect everything else to stderr or /dev/null.
-#     exit   : ran-then-failed is tolerated (the env it already printed still applies, so print
-#              env FIRST, before anything that can fail). Could-not-be-executed (126/127) ABORTS
-#              the session — a hook that silently doesn't run means the session quietly loses
-#              everything the hook guarantees, which is worse than not starting.
+#              WT_SRC_CLONE, WT_META, WT_SNAPSHOT_EXCLUDE, WT_SRC_COMMIT, WT_REF_SHA. (wt's own
+#              plumbing is also in the environment; don't build on anything not listed here.)
+#     stdout : the ENV CHANNEL. Every well-formed KEY=VALUE line is exported into the session
+#              (direnv-style), and nothing else about stdout is preserved. Values are taken
+#              literally — never eval'd — so `FOO=$(date)` exports that string, not today's date.
+#     stderr : goes to the user's terminal. Log here. To stay quiet, redirect in the hook string
+#              itself: WT_HOOK_ENTER='myhook enter 2>/dev/null'.
+#     exit   : GATES THE SESSION. Non-zero aborts `wt enter`, whatever the code. A sandbox that
+#              starts without what its hook guarantees is the expensive failure: if the hook was
+#              handing out a PER-SANDBOX daemon socket, the session silently falls back to a
+#              SHARED one and writes its build outputs into another sandbox's clone. You would
+#              not learn that from an error — you'd learn it from a corrupt artifact, days later.
+#              Anything advisory should say so: `|| true`.
 #
 # WT_HOOK_TEARDOWN — runs HOST-side when a sandbox's resources must be released: the LAST
 #   session exiting, `wt rm`, and `wt gc` reaping an orphan.
 #     env in : WT_SANDBOX. Nothing else is guaranteed — `export` anything else it needs.
-#     exit   : ignored. Must be idempotent: it is called when nothing is running, and possibly
-#              more than once.
+#     exit   : IGNORED — the opposite of the enter hook, on purpose. A sandbox whose teardown
+#              hook is broken must still be removable. Must be idempotent: it is called when
+#              nothing is running, and possibly more than once.
 #   It is not optional bookkeeping. Anything the enter hook left running in the namespace (a
 #   build daemon, a language server) pins the clone's mount and would otherwise block
 #   `zfs destroy`, so `wt rm` would fail on a sandbox that merely looks idle.
@@ -121,13 +128,15 @@ WT_DS_PARENT=rpool/data/myrepo-wt
 # A hook that gives each sandbox its own build-cache daemon instead of a shared one:
 #
 #     #!/bin/bash
+#     set -e                                                 # a real failure must abort the session
+#     sock=/tmp/mycache-$WT_SANDBOX.sock
 #     case "$1" in
 #       enter)
-#         echo "MYCACHE_SOCK=/tmp/mycache-$WT_SANDBOX.sock"     # session env, printed FIRST
-#         MYCACHE_SOCK=/tmp/mycache-$WT_SANDBOX.sock mycache start >/dev/null 2>&1 || true
+#         mycache start --socket "$sock" >&2                 # if this fails, wt enter fails. Good.
+#         echo "MYCACHE_SOCK=$sock"                          # session env
 #         ;;
 #       teardown)
-#         MYCACHE_SOCK=/tmp/mycache-$WT_SANDBOX.sock mycache stop >/dev/null 2>&1 || true
+#         mycache stop --socket "$sock" >/dev/null 2>&1 || true
 #         ;;
 #     esac
 #
@@ -148,9 +157,11 @@ WT_DS_PARENT=rpool/data/myrepo-wt
 # Default: $HOME/.wt-ssh
 #WT_SSH_DIR=$HOME/.wt-ssh
 
-# Path to wt-ssh on your LOCAL machine, relative to the checkout — baked into the ProxyCommand
-# lines that `wt ssh-config` prints for your ~/.ssh/config.
-# Default: .wt/wt-ssh
+# How the ProxyCommand lines `wt ssh-config` prints should invoke wt-ssh on your LOCAL machine.
+# A bare name is looked up on your PATH — which is where `install.sh --with-ssh` puts it. A value
+# containing a slash is taken as relative to the checkout, for projects that vendor wt-ssh in-repo
+# rather than installing it.
+# Default: wt-ssh
 #WT_SSH_PROXY=tools/wt-ssh
 
 # Where wt is installed INSIDE the container (see install.sh). Used as the sshd ForceCommand and
@@ -158,7 +169,16 @@ WT_DS_PARENT=rpool/data/myrepo-wt
 # Default: /usr/local/bin/wt
 #WT_REMOTE_BIN=/usr/local/bin/wt
 
+# If your container bind-mounts the host's ssh agent, name the socket here: sessions opened over
+# wt-ssh get SSH_AUTH_SOCK pointed at it, so git/ssh out of a sandbox works. Leave it unset unless
+# the socket really is there — overriding a working SSH_AUTH_SOCK with a dead path is worse than
+# doing nothing.
+# Default: empty (leave SSH_AUTH_SOCK as sshd set it).
+#WT_SSH_AGENT_SOCK=/ssh-agent/agent.sock
+
 # ---- test seam ----------------------------------------------------------------------------
-# Not config: wt-setup.sh's privilege drop is a single overridable command (WT_DROP_PRIV), so an
-# unprivileged unit test can substitute a no-op. Setting it in a config file is a way to get
-# your sandboxes running as root by accident. Don't.
+# Not config, and you cannot reach it from here: wt-setup.sh's privilege drop is a single
+# overridable command (WT_DROP_PRIV) so an unprivileged unit test can substitute a no-op, and `wt`
+# unsets it before crossing the sudo boundary. Only sourcing wt-setup.sh directly — which is what
+# the tests do — can set it. That is deliberate: an empty WT_DROP_PRIV means the sandbox command
+# runs as ROOT, against main's bind-mounted live .git and the shared excluded subpaths.
