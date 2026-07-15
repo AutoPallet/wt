@@ -305,6 +305,15 @@ require_zfs() {
   done
 }
 
+# Every exported name, as one comma-separated --preserve-env value. sudo-rs (the default sudo
+# on Ubuntu 25.10+) ignores -E outright — "preserving the entire environment is not supported"
+# — which would strip every WT_* input to wt-setup.sh plus the user's own session env. Both
+# sudo.ws and sudo-rs honor an explicit --preserve-env=<names> list, so name everything.
+# compgen -e emits only valid identifiers (exported bash functions' BASH_FUNC_x%% env entries
+# do not qualify, and losing those across sudo is no loss), so the list can never smuggle
+# sudo option syntax.
+preserve_env_list() { compgen -e | paste -sd, -; }
+
 # ---- subcommands ------------------------------------------------------------------------
 wt_new() {
   local name=${1:?usage: wt new <name> [ref]} ref=${2:-HEAD}
@@ -411,11 +420,12 @@ wt_enter() {
   _wt_session_marker=$active
   trap on_session_exit EXIT
 
-  # Everything wt-setup.sh needs, across the `sudo -E` boundary. WT_HOOK_ENTER rides along so
+  # Everything wt-setup.sh needs, across the sudo boundary (an explicit --preserve-env list;
+  # see preserve_env_list for why not -E). WT_HOOK_ENTER rides along so
   # setup can fire it after the privilege drop. Nothing here is language- or project-specific:
   # a consuming project injects its own session env (cargo jobs, caches, ...) via that hook.
   # WT_PATH carries our PATH across sudo, whose secure_path would otherwise strip the caller's
-  # toolchains even under -E; wt has no idea what is on it, wt-setup.sh just puts it back.
+  # toolchains even when PATH is on the preserve list; wt has no idea what is on it, wt-setup.sh just puts it back.
   # Computed before the export, not inside it: `export FOO=$(f)` throws away f's exit status, so a
   # git that failed here would sail through as an empty WT_GIT_REAL and only be caught in-namespace.
   local git_real src_commit ref_sha
@@ -438,13 +448,13 @@ wt_enter() {
   # 9>&- keeps the marker's lock fd out of the sandbox. Whatever the enter hook starts daemonizes
   # in there, and an inherited fd would hold the marker "live" long after the session ended.
   #
-  # WT_DROP_PRIV is wt-setup.sh's test seam for skipping the privilege drop, and `sudo -E` would
-  # carry it across from the caller's environment. Then the sandbox command would run as root,
-  # against main's bind-mounted live .git and the shared excluded subpaths — root-owned objects in
-  # the real repo. Nothing in a real session sets it, so drop it here and leave the seam reachable
-  # only by sourcing wt-setup.sh directly, which is what the tests do.
+  # WT_DROP_PRIV is wt-setup.sh's test seam for skipping the privilege drop, and the full-env
+  # preserve list would carry it across from the caller's environment. Then the sandbox command
+  # would run as root, against main's bind-mounted live .git and the shared excluded subpaths
+  # — root-owned objects in the real repo. Nothing in a real session sets it, so drop it here
+  # and leave the seam reachable only by sourcing wt-setup.sh directly, which is what the tests do.
   unset WT_DROP_PRIV
-  sudo -E unshare --mount --propagation private -- \
+  sudo --preserve-env="$(preserve_env_list)" unshare --mount --propagation private -- \
     "$SELF_DIR/wt-setup.sh" "$name" -- "${cmd[@]}" 9>&-
 }
 
