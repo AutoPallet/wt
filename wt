@@ -82,14 +82,20 @@ if [ -n "${WT_CONFIG:-}" ]; then
   eval "$_wt_env"        # environment wins over the file
 fi
 
-# The checkout wt clones, and the ZFS datasets behind it (made by host-zfs-setup.sh). No
-# sensible default exists for these — an install must declare them. See wt.conf.example.
+# The checkout wt clones. No sensible default — an install must declare it.
 WT_CANONICAL=${WT_CANONICAL:-}
-WT_DS_SRC=${WT_DS_SRC:-}
-WT_DS_PARENT=${WT_DS_PARENT:-}
 
 # Sandbox state (trees/, meta/, active/, locks/). On the host, outside every clone.
 WT_HOME=${WT_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/wt}
+
+# The ZFS datasets behind WT_CANONICAL and WT_HOME (made by host-zfs-setup.sh). When unset,
+# default to the ZFS dataset each is mounted from — so an install that bind-mounts both onto
+# ZFS need not repeat the names in its config. Empty when the mount isn't ZFS; require_config()
+# then reports the same "not set" error as before, so a non-ZFS install sees no regression.
+_wt_zfs_at() { findmnt -no SOURCE,FSTYPE -T "${1:-/nonexistent}" 2>/dev/null | awk '$2=="zfs"{print $1}' || true; }
+WT_DS_SRC=${WT_DS_SRC:-$(_wt_zfs_at "$WT_CANONICAL")}
+WT_DS_PARENT=${WT_DS_PARENT:-$(_wt_zfs_at "$WT_HOME")}
+unset -f _wt_zfs_at
 
 # Subpaths of the checkout that must NOT be captured in snapshots. Each is its own ZFS child
 # dataset — never snapshotted, so absent from clones — and is bind-mounted through from the

@@ -15,7 +15,8 @@
 # the code) and maps it to /etc/wt/config in the dev image.
 
 # ---- REQUIRED -----------------------------------------------------------------------------
-# There is no sensible default for these three; every dataset command dies without them.
+# WT_CANONICAL has no sensible default; every dataset command dies without it. WT_DS_SRC and
+# WT_DS_PARENT default to derived values (see below) and only need to be set to override.
 
 # The checkout wt clones — the path as the process running wt sees it. A per-sandbox clone is
 # mounted over exactly this path inside the sandbox's mount namespace, which is what keeps
@@ -28,8 +29,13 @@ WT_CANONICAL=/workspaces/myrepo
 # The ZFS dataset holding that checkout, and the dataset the per-sandbox clones hang under.
 # Both are created by host-zfs-setup.sh. WT_DS_PARENT must not live under WT_DS_SRC: `wt gc`
 # destroys children of WT_DS_PARENT, and inside WT_DS_SRC those children are your live data.
-WT_DS_SRC=rpool/data/myrepo-src
-WT_DS_PARENT=rpool/data/myrepo-wt
+#
+# Defaults:
+#   wt (runtime):       the ZFS dataset each of WT_CANONICAL / WT_HOME is mounted from
+#   host-zfs-setup.sh:  <containing ZFS dataset of CHECKOUT_DIR>/<basename CHECKOUT_DIR>-{src,wt}
+# Set only to override the derivation, or when your checkout is not on ZFS.
+#WT_DS_SRC=rpool/data/myrepo-src
+#WT_DS_PARENT=rpool/data/myrepo-wt
 
 # ---- sandbox state ------------------------------------------------------------------------
 # Where wt keeps trees/, meta/, active/ and locks/. It must be on the HOST side — outside every
