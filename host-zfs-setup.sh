@@ -93,13 +93,30 @@ if [ -n "${WT_CONFIG:-}" ]; then
 fi
 
 WT_CANONICAL=${WT_CANONICAL:-}
-WT_DS_SRC=${WT_DS_SRC:-}
-WT_DS_PARENT=${WT_DS_PARENT:-}
 WT_SNAPSHOT_EXCLUDE=${WT_SNAPSHOT_EXCLUDE:-}
 WT_ZFS_PROP=${WT_ZFS_PROP:-com.wt:managed}
 WT_TARGET_UID=${WT_TARGET_UID:-$(id -u "$ORIG_USER")}
 WT_TARGET_GID=${WT_TARGET_GID:-$(id -g "$ORIG_USER")}
 WT_TARGET_USER=${WT_TARGET_USER:-}
+
+# CHECKOUT_DIR is resolved before the WT_DS_* defaults so those defaults can derive from it.
+CHECKOUT_DIR=${args[0]:-$WT_CANONICAL}
+[ -n "$CHECKOUT_DIR" ] \
+  || die "no checkout path: pass one as the first argument, or set WT_CANONICAL (config: ${WT_CONFIG:-none found})"
+case "$CHECKOUT_DIR" in /*) ;; *) die "checkout path must be absolute: $CHECKOUT_DIR" ;; esac
+CHECKOUT_DIR=${CHECKOUT_DIR%/}
+WT_DIR=${args[1]:-${CHECKOUT_DIR}-wt}
+ASIDE_DIR=$CHECKOUT_DIR.aside
+
+# The datasets host-zfs-setup will create. When unset, default to the ZFS dataset containing
+# CHECKOUT_DIR plus "-src" / "-wt" — matching the wt.conf.example naming convention. Empty when
+# CHECKOUT_DIR isn't under ZFS, in which case the required-vars check below fires as before, so
+# an install that keeps its checkout outside ZFS sees no regression.
+_hzs_containing_ds=$(findmnt -no SOURCE,FSTYPE -T "$CHECKOUT_DIR" 2>/dev/null | awk '$2=="zfs"{print $1}' || true)
+_hzs_basename=$(basename "$CHECKOUT_DIR")
+WT_DS_SRC=${WT_DS_SRC:-${_hzs_containing_ds:+${_hzs_containing_ds}/${_hzs_basename}-src}}
+WT_DS_PARENT=${WT_DS_PARENT:-${_hzs_containing_ds:+${_hzs_containing_ds}/${_hzs_basename}-wt}}
+unset _hzs_containing_ds _hzs_basename
 
 [ -n "$WT_DS_SRC" ]    || die "WT_DS_SRC is not set (config: ${WT_CONFIG:-none found}) — see wt.conf.example"
 [ -n "$WT_DS_PARENT" ] || die "WT_DS_PARENT is not set (config: ${WT_CONFIG:-none found}) — see wt.conf.example"
@@ -119,14 +136,6 @@ esac
 case "$WT_DS_SRC" in
   "$WT_DS_PARENT"/*) die "WT_DS_SRC must not live under WT_DS_PARENT ($WT_DS_PARENT)" ;;
 esac
-
-CHECKOUT_DIR=${args[0]:-$WT_CANONICAL}
-[ -n "$CHECKOUT_DIR" ] \
-  || die "no checkout path: pass one as the first argument, or set WT_CANONICAL (config: ${WT_CONFIG:-none found})"
-case "$CHECKOUT_DIR" in /*) ;; *) die "checkout path must be absolute: $CHECKOUT_DIR" ;; esac
-CHECKOUT_DIR=${CHECKOUT_DIR%/}
-WT_DIR=${args[1]:-${CHECKOUT_DIR}-wt}
-ASIDE_DIR=$CHECKOUT_DIR.aside
 
 # ---- identity to delegate to --------------------------------------------------------------
 # ZFS delegation is stored by uid, and the container bind-mount preserves uids — so the account

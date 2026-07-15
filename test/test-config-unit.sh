@@ -66,6 +66,58 @@ grep -q 'zfs property  : com.wt:managed' <<<"$out" \
   && ok "falls back to the built-in default when neither env nor file sets it" \
   || no "default WT_ZFS_PROP wrong: $(grep 'zfs property' <<<"$out")"
 
+echo "== defaults: WT_DS_SRC and WT_DS_PARENT derive from the mount table when unset =="
+# Stub findmnt so the derivation runs without a real ZFS mount. wt calls it as
+# `findmnt -no SOURCE,FSTYPE -T <path>` — key by path so WT_CANONICAL and WT_HOME resolve
+# to different datasets, and by fstype so a non-ZFS mount is filtered out.
+mkdir -p "$T/bin"
+cat > "$T/bin/findmnt" <<'EOF'
+#!/bin/bash
+path=${!#}
+case "$path" in
+  /derived/canonical) echo 'pool/derived-src zfs' ;;
+  /derived/home)      echo 'pool/derived-parent zfs' ;;
+  /nonzfs/*)          echo '/dev/sda1 ext4' ;;
+esac
+EOF
+chmod +x "$T/bin/findmnt"
+stub_status() { env -i PATH="$T/bin:$PATH" HOME="$T" "$@" bash "$WT" status 2>/dev/null; }
+
+out=$(stub_status WT_CONFIG= WT_CANONICAL=/derived/canonical WT_HOME=/derived/home)
+{ grep -q 'src dataset   : pool/derived-src' <<<"$out" \
+    && grep -q 'wt dataset    : pool/derived-parent' <<<"$out"; } \
+  && ok "WT_DS_SRC / WT_DS_PARENT default to the ZFS dataset WT_CANONICAL / WT_HOME is mounted from" \
+  || no "derivation failed: $(grep -E 'src dataset|wt dataset' <<<"$out" | tr '\n' ' ')"
+
+# A non-ZFS mount is filtered out — otherwise a plain-directory checkout would be handed to
+# `zfs clone` with whatever /dev block it happens to sit on.
+out=$(stub_status WT_CONFIG= WT_CANONICAL=/nonzfs/checkout WT_HOME=/nonzfs/home)
+{ grep -q 'src dataset   : UNSET' <<<"$out" \
+    && grep -q 'wt dataset    : UNSET' <<<"$out"; } \
+  && ok "a non-ZFS mount is filtered out (require_config would then die as it does today)" \
+  || no "a non-ZFS mount was accepted as a dataset: $(grep -E 'src dataset|wt dataset' <<<"$out")"
+
+# Precedence must extend to the derived defaults: env > file > derivation. An explicit override
+# must not be silently replaced by whatever findmnt returns.
+out=$(stub_status WT_CONFIG= WT_CANONICAL=/derived/canonical WT_HOME=/derived/home \
+                  WT_DS_SRC=pool/env-src WT_DS_PARENT=pool/env-parent)
+{ grep -q 'src dataset   : pool/env-src' <<<"$out" \
+    && grep -q 'wt dataset    : pool/env-parent' <<<"$out"; } \
+  && ok "an explicit env value wins over the derivation" \
+  || no "derivation overrode an explicit env value: $(grep -E 'src dataset|wt dataset' <<<"$out")"
+
+cat > "$T/config-derive" <<'EOF'
+WT_CANONICAL=/derived/canonical
+WT_HOME=/derived/home
+WT_DS_SRC=pool/file-src
+WT_DS_PARENT=pool/file-parent
+EOF
+out=$(stub_status WT_CONFIG="$T/config-derive")
+{ grep -q 'src dataset   : pool/file-src' <<<"$out" \
+    && grep -q 'wt dataset    : pool/file-parent' <<<"$out"; } \
+  && ok "an explicit file value wins over the derivation" \
+  || no "derivation overrode an explicit file value: $(grep -E 'src dataset|wt dataset' <<<"$out")"
+
 echo "== exclude_key: injective, and identical on both sides of the sudo boundary =="
 # wt and wt-setup.sh each derive this independently — wt to CREATE the hold dir, wt-setup.sh to
 # BIND it — on opposite sides of `sudo`. If they ever disagree, a sandbox binds the wrong live
