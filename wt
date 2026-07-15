@@ -312,6 +312,12 @@ require_zfs() {
 # compgen -e emits only valid identifiers (exported bash functions' BASH_FUNC_x%% env entries
 # do not qualify, and losing those across sudo is no loss), so the list can never smuggle
 # sudo option syntax.
+#
+# One semantic delta from -E itself: sudo.ws applied env_delete even under -E, stripping a
+# fixed list (LD_*, IFS, BASH_ENV, PS4, ...) regardless of what you asked to preserve. An
+# explicit --preserve-env=<names> list is env_keep-shaped instead and can carry those through if
+# they happen to be exported. Harmless under wt's documented blanket-sudo model — the caller
+# could already `sudo bash` and set any of them directly — but worth knowing about.
 preserve_env_list() { compgen -e | paste -sd, -; }
 
 # ---- subcommands ------------------------------------------------------------------------
