@@ -196,6 +196,15 @@ wt new alpha >/dev/null 2>&1 \
 wt new ../escape >/dev/null 2>&1 \
   && no "an invalid sandbox name was accepted" || ok "an invalid sandbox name is refused"
 
+# From inside a sandbox (WT_SANDBOX set), `wt new` would build a hybrid: main's snapshot bytes
+# under the calling sandbox's HEAD. It must refuse before creating anything.
+out=$(env PATH="$T/bin:$PATH" WT_CONFIG= ZFS_STATE="$ZFS_STATE" WT_HOME="$WT_HOME" \
+      WT_CANONICAL="$CANON" WT_DS_SRC="$DS_SRC" WT_DS_PARENT="$DS_PARENT" WT_ZFS_PROP="$PROP" \
+      WT_SANDBOX=outer bash "$WT" new nested 2>&1); rc=$?
+{ [ "$rc" -ne 0 ] && [[ "$out" == *sandbox* ]] && [ ! -d "$WT_HOME/trees/nested" ]; } \
+  && ok "wt new refuses to run inside a sandbox, creating nothing" \
+  || no "wt new nested inside a sandbox (rc=$rc): $out"
+
 echo "== wt gc must not reap a sandbox that is being born =="
 # A tagged, clone-less snapshot whose tree exists: precisely the window inside `wt new` between
 # `zfs snapshot` and `zfs clone`. gc must leave it alone. (Regression guard: gc used to reap it,
@@ -276,6 +285,31 @@ wt rm ghost >/dev/null 2>"$T/ghost.err"; rc=$?
 [ "$rc" -ne 0 ] \
   && ok "wt rm <typo> FAILS instead of reporting success" \
   || no "wt rm reported success for a sandbox that never existed"
+
+echo "== wt rm refuses a clone with user-made dependents =="
+wt new beta >/dev/null 2>&1 || { echo "  SETUP FAILED: wt new beta"; exit 1; }
+# A user-made snapshot of the clone plus a child dataset inside it: `zfs destroy` would fail on
+# every retry, so wt rm must refuse up front — naming both, destroying nothing, touching nothing.
+printf '%s\n' "$DS_PARENT/beta@keepme" >> "$ZFS_STATE/snapshots"
+printf '%s\n' "$DS_PARENT/beta/inner" >> "$ZFS_STATE/datasets"
+: > "$ZFS_STATE/destroy.log"
+wt rm beta >/dev/null 2>"$T/deps.err"; rc=$?
+{ [ "$rc" -ne 0 ] && grep -q 'dependents' "$T/deps.err" \
+  && grep -q "$DS_PARENT/beta@keepme" "$T/deps.err" \
+  && grep -q "$DS_PARENT/beta/inner" "$T/deps.err"; } \
+  && ok "wt rm refuses a clone with dependents, and names them" \
+  || no "wt rm dependents refusal (rc=$rc): $(cat "$T/deps.err")"
+[ ! -s "$ZFS_STATE/destroy.log" ] && [ -d "$WT_HOME/trees/beta" ] \
+  && git -C "$CANON" show-ref --verify --quiet refs/heads/wt/beta \
+  && ok "...destroying nothing and leaving the sandbox intact" \
+  || no "wt rm touched state while refusing: destroys=[$(tr '\n' ' ' < "$ZFS_STATE/destroy.log")]"
+# Clear the dependents; the same rm must now succeed.
+grep -vxF "$DS_PARENT/beta@keepme" "$ZFS_STATE/snapshots" > "$ZFS_STATE/.s"; mv "$ZFS_STATE/.s" "$ZFS_STATE/snapshots"
+grep -vxF "$DS_PARENT/beta/inner" "$ZFS_STATE/datasets" > "$ZFS_STATE/.d"; mv "$ZFS_STATE/.d" "$ZFS_STATE/datasets"
+wt rm beta >/dev/null 2>"$T/deps2.err"; rc=$?
+[ "$rc" -eq 0 ] && [ ! -d "$WT_HOME/trees/beta" ] \
+  && ok "...and succeeds once the dependents are gone" \
+  || no "wt rm after clearing dependents failed (rc=$rc): $(cat "$T/deps2.err")"
 
 echo "== the datasets must be disjoint, in both directions =="
 # With the SOURCE nested under the PARENT, gc's clone sweep enumerates the source dataset and its

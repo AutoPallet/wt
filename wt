@@ -280,11 +280,18 @@ on_session_exit() {
 # Kill any process whose mount namespace still has $1 (a clone dataset) mounted — e.g. a
 # daemonized IDE server that outlived its ssh session — so `zfs destroy` isn't blocked.
 # Reading another namespace/owner's mountinfo needs root, hence sudo.
+#
+# The match is anchored to mountinfo's mount-source field (the second field after the `-`
+# separator; see proc_pid_mountinfo(5)), not the whole line: a mount whose mount-POINT path
+# merely ends in the dataset name must not earn its namespace a SIGTERM.
 kill_clone_holders() {
   local clone=$1 p
   for p in /proc/[0-9]*; do
     p=${p#/proc/}
-    if sudo grep -qF "$clone " "/proc/$p/mountinfo" 2>/dev/null; then
+    if sudo awk -v c="$clone" '
+         { for (i = 7; i <= NF; i++) if ($i == "-") { if ($(i+2) == c) found = 1; break } }
+         END { exit !found }
+       ' "/proc/$p/mountinfo" 2>/dev/null; then
       log "killing lingering holder pid $p (clone $clone still mounted)"
       sudo kill -TERM "$p" 2>/dev/null || true
     fi
@@ -308,6 +315,14 @@ require_zfs() {
 # ---- subcommands ------------------------------------------------------------------------
 wt_new() {
   local name=${1:?usage: wt new <name> [ref]} ref=${2:-HEAD}
+  # Refuse from inside a sandbox: the snapshot/clone would come from MAIN's datasets while the
+  # branch, ref_sha and seeded index come from THIS sandbox's HEAD — a worktree that registers
+  # durably and looks valid, but whose files are main's tree with this sandbox's baseline, so
+  # `git status` shows a huge spurious diff and this sandbox's work is silently absent. To fork
+  # a sandbox: commit in it (wt/<name> is visible from main via the shared .git), then from
+  # main run `wt new <other> wt/<name>`.
+  [ -z "${WT_SANDBOX:-}" ] \
+    || die "wt new cannot run inside a sandbox (you are in '$WT_SANDBOX') — run it from main"
   require_config; validate_name "$name"; set_paths "$name"; require_zfs
 
   mkdir -p "$WT_HOME"/{trees,meta,active}
@@ -339,9 +354,15 @@ wt_new() {
   local ref_sha src_commit
   ref_sha=$(git -C "$WT_CANONICAL" rev-parse --verify "$ref^{commit}") \
     || die "could not resolve ref '$ref'"
-  src_commit=$(git -C "$WT_CANONICAL" rev-parse --verify HEAD)
   mkdir -p "$tree"
   git -C "$WT_CANONICAL" worktree add --no-checkout -b "wt/$name" "$tree" "$ref_sha"
+
+  # The baseline commit the snapshot's files correspond to. Read as late as possible — right
+  # before the seed/snapshot, after the slow worktree registration — because a commit landing on
+  # main between this read and the snapshot makes meta/src_commit name a staler baseline than the
+  # snapshot's bytes, which costs the non-HEAD materialization path its cheap read-tree and some
+  # build warmth.
+  src_commit=$(git -C "$WT_CANONICAL" rev-parse --verify HEAD)
 
   # Seed the index. git judges cleanliness working-tree-vs-INDEX (then index-vs-HEAD), and
   # --no-checkout leaves the index empty — without this, every file the clone provides reads as
@@ -575,6 +596,19 @@ wt_rm() {
   # the destroy below can still find it.
   [ -n "$clone" ] || clone="$WT_DS_PARENT/$name"
 
+  # A snapshot or child dataset under the clone (wt never creates either — it only snapshots
+  # WT_DS_SRC) defeats `zfs destroy` on every attempt: the retry loop below would burn its full
+  # ~15s, kill mount-holders that are not the blocker, and only then surface ZFS's real error.
+  # It is user-made data, so refuse up front — before the tree, metadata or branch are touched —
+  # and name it. Never destroy it with -R on the user's behalf.
+  if zfs list -H -o name "$clone" >/dev/null 2>&1; then
+    local deps
+    deps=$( { zfs list -H -o name -t snapshot -d 1 "$clone" 2>/dev/null; \
+              zfs list -H -o name -d 1 "$clone" 2>/dev/null | tail -n +2; } | sed '/^$/d' )
+    [ -z "$deps" ] || die "clone $clone has dependents; destroy them first:
+$deps"
+  fi
+
   [ -d "$tree" ] && { git -C "$WT_CANONICAL" worktree remove --force "$tree" 2>/dev/null || true; }
   safe_rmrf "$meta"; safe_rmrf "$tree"
   git -C "$WT_CANONICAL" worktree prune 2>/dev/null || true
@@ -656,22 +690,28 @@ wt_status() {
 
 wt_ssh_config() {
   local repo="${1:-LOCAL_REPO}"   # this checkout's path on your local machine; the container can't know it
+  local caller="${2:-}"           # absolute local path of the wt-ssh generating this config, if any
   local d name proxy
-  # A bare WT_SSH_PROXY (the default, `wt-ssh`) is looked up on your local PATH, which is where
-  # `install.sh --with-ssh` put it. One containing a slash is relative to the checkout, for
-  # projects that vendor wt-ssh instead of installing it.
+  # The ProxyCommand target, in order: a WT_SSH_PROXY containing a slash is a project that
+  # vendors wt-ssh at a checkout-relative path — deliberate config, it wins. Otherwise the
+  # absolute path of the wt-ssh that is generating this config (passed through by its `config`
+  # verb) is known-good on the local machine whether or not it is on PATH. A bare PATH-looked-up
+  # name is the last resort, for hand-run `wt ssh-config`.
   case "$WT_SSH_PROXY" in
     */*) proxy="$repo/$WT_SSH_PROXY" ;;
-    *)   proxy="$WT_SSH_PROXY" ;;
+    *)   proxy="${caller:-$WT_SSH_PROXY}" ;;
   esac
   echo "# --- wt-ssh: paste into ~/.ssh/config on your local machine ---"
   [ "$repo" = LOCAL_REPO ] && \
     echo "# Replace LOCAL_REPO with this checkout's path on your local machine (the source of $WT_CANONICAL)."
+  # WT_SSH_REPO is baked into every ProxyCommand: ssh runs it from an arbitrary directory (an
+  # editor typically spawns it from $HOME), where wt-ssh could not otherwise tell which checkout
+  # — and so which container — the session is for.
   for d in "$WT_HOME"/trees/*/; do
     [ -d "$d" ] || continue
     name=$(basename "$d")
-    printf '\nHost wt-%s\n  User %s\n  ProxyCommand %s proxy %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' \
-      "$name" "$WT_TARGET_USER" "$proxy" "$name"
+    printf '\nHost wt-%s\n  User %s\n  ProxyCommand env WT_SSH_REPO=%s %s proxy %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' \
+      "$name" "$WT_TARGET_USER" "$repo" "$proxy" "$name"
   done
 }
 
@@ -688,7 +728,6 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 AllowUsers $WT_TARGET_USER
 AuthorizedKeysFile $WT_SSH_DIR/authorized_keys
-AcceptEnv WT_SANDBOX
 ForceCommand $WT_REMOTE_BIN ssh-forced
 PermitTTY yes
 LogLevel INFO
@@ -708,13 +747,18 @@ EOF
     rm -f "$keys"
     die "no public keys found (agent empty and no $HOME/.ssh/*.pub) — add a key and re-run"
   fi
+  # Header first, so the file doesn't read as hand-maintained: it is rebuilt on every container
+  # start, and a key appended here by hand silently vanishes on the next one.
+  printf '%s\n%s\n' \
+    "# Generated by 'wt ssh-setup' — rebuilt on container start; add persistent keys as ~/.ssh/*.pub" \
+    "$(cat "$keys")" > "$keys"
   chmod 600 "$keys"
   mv -f "$keys" "$WT_SSH_DIR/authorized_keys"
 
   sudo /usr/sbin/sshd -t -f "$WT_SSH_DIR/sshd_config" \
     || die "generated sshd_config failed 'sshd -t' validation"
 
-  log "wt-ssh ready: $(grep -c . "$WT_SSH_DIR/authorized_keys") key(s) authorized in $WT_SSH_DIR"
+  log "wt-ssh ready: $(grep -cE '^(ssh-|ecdsa-|sk-)' "$WT_SSH_DIR/authorized_keys") key(s) authorized in $WT_SSH_DIR"
   log "on your local machine: run 'wt-ssh config' from the checkout and paste it into ~/.ssh/config"
 }
 

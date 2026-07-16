@@ -27,12 +27,27 @@
 #   WT_SSH_DRYRUN     print the resolved `docker exec` argv and exit (for tests)
 set -euo pipefail
 
-# The checkout this script was invoked from. Ask git rather than counting `..` levels: the
-# generated ProxyCommand points at wherever the consuming project keeps wt-ssh, and its depth
-# below the repo root is that project's business, not ours.
+# The checkout this serves. In order:
+#   $WT_SSH_REPO           explicit override; the generated ProxyCommand lines use it, so an ssh
+#                          session resolves the same repo whatever directory ssh runs from
+#   this script's repo     the vendored case (wt-ssh copied into the consuming repo) — asked of
+#                          git rather than counted in `..` levels, because the script's depth
+#                          below the repo root is that project's business; taken only when a wt
+#                          config is actually there, because an INSTALLED wt-ssh's real path
+#                          resolves into the wt checkout itself, which serves no project
+#   the caller's repo      the installed-on-PATH case: run `wt-ssh` from inside your project
+has_wt_conf() { [ -r "$1/.wt.conf" ] || [ -r "$1/.config/wt.conf" ]; }
 here=$(dirname "$(readlink -f "$0")")
 self=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null) || self=$(cd "$here/.." && pwd)
-repo=$(realpath -m "${WT_SSH_REPO:-$self}")
+if [ -n "${WT_SSH_REPO:-}" ]; then
+  repo=$WT_SSH_REPO
+elif has_wt_conf "$self"; then
+  repo=$self
+else
+  cwd_repo=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -n "$cwd_repo" ] && has_wt_conf "$cwd_repo"; then repo=$cwd_repo; else repo=$self; fi
+fi
+repo=$(realpath -m "$repo")
 
 # Environment wins over the config file, same rule as wt.
 _env=$(export -p | grep -E '^declare -x WT_[A-Za-z0-9_]+=' || true)
@@ -83,7 +98,9 @@ resolve_cid() {
 
 verb=${1:-}; shift || true
 case "$verb" in
-  config) cid=$(resolve_cid); set -- docker exec -u "$WT_TARGET_USER" "$cid" "$WT_REMOTE_BIN" ssh-config "$repo" ;;
+  # The second argument is this script's own absolute path: the generated ProxyCommand lines
+  # point back at it, so the ssh transport works whether or not wt-ssh is also on PATH.
+  config) cid=$(resolve_cid); set -- docker exec -u "$WT_TARGET_USER" "$cid" "$WT_REMOTE_BIN" ssh-config "$repo" "$(readlink -f "$0")" ;;
   list)   cid=$(resolve_cid); set -- docker exec -u "$WT_TARGET_USER" "$cid" "$WT_REMOTE_BIN" list ;;
   proxy)  name=${1:-}; [ -n "$name" ] || usage; cid=$(resolve_cid)
           set -- docker exec -u0 -i "$cid" "$WT_REMOTE_BIN" ssh-serve "$name" ;;

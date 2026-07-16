@@ -40,8 +40,8 @@ out=$(run_wt_ssh proxy scan)
   || no "proxy resolver picks c2" "$out"
 
 out=$(run_wt_ssh config)
-[[ "$out" == *"docker exec -u dev c2 /usr/local/bin/wt ssh-config /home/u/myrepo"* ]] \
-  && ok "config proxies wt ssh-config with the auto-filled repo path, as the target user" \
+[[ "$out" == *"docker exec -u dev c2 /usr/local/bin/wt ssh-config /home/u/myrepo $(readlink -f "$WTSSH")"* ]] \
+  && ok "config proxies wt ssh-config with the repo path and its own path, as the target user" \
   || no "config argv" "$out"
 
 out=$(run_wt_ssh list)
@@ -69,6 +69,46 @@ out=$(env $ENV WT_SSH_DRYRUN=1 WT_SSH_CONTAINER=deadbeef WT_SSH_REPO=/whatever \
 out=$(env $ENV WT_SSH_DRYRUN=1 bash -c 'docker(){ echo SHOULD-NOT-CALL; }; export -f docker; exec "$@"' _ "$WTSSH" proxy 2>&1); rc=$?
 { [ "$rc" -eq 2 ] && [[ "$out" == *"usage: wt-ssh"* ]] && [[ "$out" != *"SHOULD-NOT-CALL"* ]]; } \
   && ok "proxy without a name -> usage without touching docker" || no "proxy-no-name gate" "rc=$rc $out"
+
+# Installed-on-PATH case: wt-ssh's own real path resolves into the wt checkout, which serves no
+# project — so with no WT_SSH_REPO it must fall back to the repo the CALLER is standing in and
+# read that repo's config. (Regression guard: it used to look for config only in its own repo,
+# so an installed wt-ssh could never serve a consuming project.)
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+mkdir -p "$T/proj/.config"
+git -C "$T/proj" init -q 2>/dev/null
+printf 'WT_CANONICAL=/workspaces/myrepo\nWT_TARGET_USER=dev\n' > "$T/proj/.config/wt.conf"
+out=$(cd "$T/proj" && env WT_SSH_DRYRUN=1 bash -c 'docker(){ case "$1" in
+    ps) echo c9;;
+    inspect) case "$*" in *.Destination*/workspaces/myrepo*.Source*) echo "'"$T"'/proj";; esac ;;
+  esac; }; export -f docker; exec "$@"' _ "$WTSSH" config)
+[[ "$out" == *"docker exec -u dev c9 /usr/local/bin/wt ssh-config $T/proj"* ]] \
+  && ok "no WT_SSH_REPO -> falls back to the caller's repo and finds its config" \
+  || no "cwd-repo fallback" "$out"
+
+# The generated ~/.ssh/config must bake WT_SSH_REPO into every ProxyCommand: ssh runs the
+# ProxyCommand from an arbitrary directory, where the cwd fallback above cannot help.
+WT="$DIR/../wt"
+mkdir -p "$T/home/trees/foo"
+out=$(env WT_CONFIG= WT_HOME="$T/home" WT_TARGET_USER=dev bash "$WT" ssh-config /home/u/myrepo)
+[[ "$out" == *"ProxyCommand env WT_SSH_REPO=/home/u/myrepo wt-ssh proxy foo"* ]] \
+  && ok "wt ssh-config bakes WT_SSH_REPO into the ProxyCommand" \
+  || no "ProxyCommand repo baking" "$out"
+
+# When the generating wt-ssh passes its own path (second arg), the ProxyCommand points at it
+# absolutely — the ssh transport must not depend on wt-ssh also being on PATH.
+out=$(env WT_CONFIG= WT_HOME="$T/home" WT_TARGET_USER=dev bash "$WT" ssh-config /home/u/myrepo /home/u/src/wt/wt-ssh)
+[[ "$out" == *"ProxyCommand env WT_SSH_REPO=/home/u/myrepo /home/u/src/wt/wt-ssh proxy foo"* ]] \
+  && ok "wt ssh-config prefers the generating wt-ssh's absolute path over a PATH lookup" \
+  || no "ProxyCommand caller path" "$out"
+
+# ...unless the project vendors wt-ssh at a checkout-relative WT_SSH_PROXY, which is deliberate
+# config and wins over the caller's path.
+out=$(env WT_CONFIG= WT_HOME="$T/home" WT_TARGET_USER=dev WT_SSH_PROXY=.devcontainer/wt-ssh \
+      bash "$WT" ssh-config /home/u/myrepo /home/u/src/wt/wt-ssh)
+[[ "$out" == *"ProxyCommand env WT_SSH_REPO=/home/u/myrepo /home/u/myrepo/.devcontainer/wt-ssh proxy foo"* ]] \
+  && ok "a vendored (slash) WT_SSH_PROXY wins over the caller's path" \
+  || no "ProxyCommand vendored proxy" "$out"
 
 echo "wt-ssh-unit: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
