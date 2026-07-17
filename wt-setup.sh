@@ -143,20 +143,35 @@ cd "$WT_CANONICAL"
 # is what keeps the build warm) but points the branch at <ref> — so the clone holds main's files,
 # not <ref>'s. Materialize <ref> here, where the clone is mounted and writable, with as few CoW
 # writes as possible: seed the index from the clone's actual baseline (WT_SRC_COMMIT), refresh
-# stat info, then let a two-tree read-tree write only the files that differ (falling back to a
-# hard reset if local state conflicts). As the target user, so the files and index are theirs.
-# A host-side sentinel makes it once-only, so re-entry preserves the sandbox's working state.
+# stat info, then let a two-tree read-tree write only the files that differ. As the target user,
+# so the files and index are theirs. A host-side sentinel makes it once-only, so re-entry
+# preserves the sandbox's working state.
 # Skipped for the common case (WT_REF_SHA == WT_SRC_COMMIT), where `wt new` seeded the index.
+#
+# read-tree -m -u refuses when a locally-dirty path also differs baseline->ref — and the clone
+# carries main's dirty diff, which `wt new` promised would survive. So on refusal: record the
+# dirt against the baseline, hard-reset to the ref, and replay the dirt on top. Non-conflicting
+# edits survive; a genuinely conflicting file gets conflict markers instead of silently
+# reverting to the ref's version. (An untracked file that the ref wants to create is still
+# overwritten by the reset — read-tree's message below names it.)
 if [ -n "${WT_REF_SHA:-}" ] && [ -n "${WT_SRC_COMMIT:-}" ] \
    && [ "$WT_REF_SHA" != "$WT_SRC_COMMIT" ] && [ ! -e "$WT_META/materialized" ]; then
   # shellcheck disable=SC2086
   if $WT_DROP_PRIV bash -c '
         set -e
         cd "$1"
-        git read-tree "$2"                                                # index <- clone baseline
-        git update-index -q --refresh || true                             # stamp stat; clean baseline
-        git read-tree -m -u "$3" 2>/dev/null || git reset -q --hard "$3"  # write only the diffs
-        git update-index -q --refresh || true
+        git read-tree "$2"                             # index <- clone baseline
+        git update-index -q --refresh >/dev/null || true   # stamp stat; clean baseline
+        if ! rt_err=$(git read-tree -m -u "$3" 2>&1); then # write only the diffs
+          echo "wt: carried working-tree changes overlap the checkout of $3:" >&2
+          printf "%s\n" "$rt_err" | sed "s/^/wt:   /" >&2
+          dirt=$(git diff --binary "$2")
+          git reset -q --hard "$3"
+          if [ -n "$dirt" ] && ! printf "%s\n" "$dirt" | git apply --3way; then
+            echo "wt: some carried changes conflict with $3 — look for conflict markers" >&2
+          fi
+        fi
+        git update-index -q --refresh >/dev/null || true
       ' _ "$WT_CANONICAL" "$WT_SRC_COMMIT" "$WT_REF_SHA"; then
     : > "$WT_META/materialized"
     chown "$WT_TARGET_UID:$WT_TARGET_GID" "$WT_META/materialized" 2>/dev/null || true
@@ -164,6 +179,16 @@ if [ -n "${WT_REF_SHA:-}" ] && [ -n "${WT_SRC_COMMIT:-}" ] \
     echo "wt: failed to check out $WT_REF_SHA into sandbox; left at baseline $WT_SRC_COMMIT" >&2
   fi
 fi
+
+# Stamp the index's stat cache. On the common path (`wt new <name>` with no ref), the index was
+# seeded host-side with a bare read-tree, which stores NO stat data — so git's first look at the
+# tree re-hashes every tracked file through its clean filters, and plumbing like `git diff`
+# (which never writes the index back) pays that on every call. One refresh here, as the target
+# user against the mounted clone, settles it: subsequent enters are a fast all-match stat sweep.
+# stdout is silenced because --refresh lists carried-dirty files, which is noise at every enter;
+# `|| true` because a non-empty such list is also its exit status.
+# shellcheck disable=SC2086
+$WT_DROP_PRIV git -C "$WT_CANONICAL" update-index -q --refresh >/dev/null 2>&1 || true
 
 # Fire the enter hook and export what it emits, before handing off. Done here rather than from a
 # shell rc file so it also covers a directly-exec'd command (`wt enter x -- cmd`), which never

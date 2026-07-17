@@ -114,17 +114,54 @@ what root mounts and what root deletes. Gate who may run `wt` at all, not what i
 
 `wt-ssh` runs on your machine, not in the container, and hands your editor an SSH session
 *into* a sandbox over `docker exec`: sshd speaks its protocol over the pipe (`sshd -i`), so no
-port is bound anywhere.
+port is bound anywhere. Two machines, three pieces:
+
+- **Inside the container, once:** `wt ssh-setup` writes an inetd-style sshd config and rebuilds
+  `authorized_keys` from your agent plus `~/.ssh/*.pub`. Run it from your container's start hook
+  (as `wt ssh-setup || true`) so it survives a container restart — and don't hand-edit the
+  generated file, the next start rewrites it.
+- **On your machine, once:** `wt-ssh config >> ~/.ssh/config` emits one `Host wt-<name>` block
+  per sandbox. Run it from inside your project's checkout — that is how wt-ssh knows which repo,
+  and so which devcontainer, it serves. Each generated block bakes in both the repo path and the
+  absolute path of the wt-ssh that generated it, so ssh itself can then run from anywhere and
+  needs nothing on PATH.
+- **Every `ssh wt-<name>`** (or a VS Code / JetBrains remote pointed at it) then flows:
+  ssh → `wt-ssh proxy` (a ProxyCommand) → `docker exec` → inetd sshd in the container →
+  `wt enter <name>`.
+
+`wt-ssh` is a standalone script and installing it is optional — putting it on PATH is a
+convenience, not a requirement:
 
 ```sh
-sudo ./install.sh --with-ssh      # on your machine: installs wt-ssh alongside wt
-wt ssh-setup                      # inside the container, once: sshd config + authorized_keys
-wt-ssh config >> ~/.ssh/config    # on your machine: one `Host wt-<name>` per sandbox
-ssh wt-foo                        # or point VS Code / JetBrains at it
+cd ~/code/myrepo && ~/src/wt/wt-ssh config >> ~/.ssh/config   # straight from a wt checkout
+sudo ./install.sh --with-ssh                                  # or: put `wt-ssh` on PATH
 ```
 
-Run `wt ssh-setup` from your container's start hook (as `wt ssh-setup || true`) so it survives a
-container restart.
+**Known limitation:** interactive sessions and remote editors work; `scp` and `sftp` do not
+("subsystem request failed"). Every session is forced through `wt enter`, and no SFTP subsystem
+is wired through it. Move files with git, or with `tar`/`cat` over the ssh pipe.
+
+## Sharp edges
+
+**Forking a sandbox.** Sandboxes always clone *main's* tree; there is deliberately no
+clone-of-a-clone (a ZFS dependency chain would make `wt rm` of the forked-from sandbox need
+`zfs promote`). To fork sandbox A's work: commit inside A — branch `wt/A` is immediately
+visible from main, the `.git` is shared — then, from main:
+
+```sh
+wt new B wt/A
+```
+
+B starts from main's current (warm) build tree and materializes A's tree on first enter, so
+only what A's diff touched rebuilds.
+
+**A brand-new sandbox may report files as modified that main calls clean.** That is not wt
+corrupting the tree: those files genuinely disagree with what their clean filter (LFS,
+line-ending normalization) would produce today — typically content committed before the filter
+rule existed. Main hides the divergence behind its warm stat cache; a freshly seeded sandbox
+index re-checks content and reports it. Fix the repository itself (`git add --renormalize .`
+and commit), and until then know that `git commit -a` in a sandbox would commit that
+renormalization.
 
 ## License
 
