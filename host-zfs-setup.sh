@@ -49,12 +49,13 @@ die() { echo "host-zfs-setup: $*" >&2; exit 1; }
 log() { echo "host-zfs-setup: $*" >&2; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; }
 
-# Root is needed for zfs create/mount, chown, and the `sudo -u` delegation probe. -E so a WT_*
-# override (WT_CONFIG above all) set by the caller survives into the root pass. A sudoers policy
-# that forbids -E makes sudo refuse the command outright rather than degrade — run this as root
-# directly if that is your setup.
+# Root is needed for zfs create/mount, chown, and the `sudo -u` delegation probe. An explicit
+# --preserve-env=<names> list, not -E, so a WT_* override (WT_CONFIG above all) set by the caller
+# survives into the root pass: sudo-rs (the default sudo on Ubuntu 25.10+) silently ignores -E
+# instead of refusing or erroring, which would drop every WT_* input with no sign anything went
+# wrong. compgen -e names everything currently exported.
 if [ "$(id -u)" -ne 0 ]; then
-  exec sudo -E "$0" "$@"
+  exec sudo --preserve-env="$(compgen -e | paste -sd, -)" "$0" "$@"
 fi
 
 assume_yes=0

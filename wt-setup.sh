@@ -89,12 +89,12 @@ run_enter_hook() {
 name="$1"; shift
 [ "${1:-}" = -- ] && shift
 
-# sudo's secure_path strips PATH to system dirs even under -E, hiding the caller's toolchains
+# sudo's secure_path strips PATH to system dirs even when PATH is preserved, hiding the caller's toolchains
 # from the process we drop to. `wt` stashes the real PATH in WT_PATH (which sudo does preserve)
 # purely so we can put it back. wt has no idea what is on it.
 export PATH="${WT_PATH:-$PATH}"
 
-# Every input arrives as WT_* env from `wt`, through `sudo -E`.
+# Every input arrives as WT_* env from `wt`, through `sudo --preserve-env`.
 : "${WT_CANONICAL:?}" "${WT_SRC_CLONE:?}" "${WT_META:?}"
 : "${WT_GIT_HOLD:?}" "${WT_GIT_REAL:?}" "${WT_HOLD_DIR:?}"
 

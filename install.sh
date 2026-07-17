@@ -75,7 +75,10 @@ if [ ! -d "$PREFIX" ] || [ ! -w "$PREFIX" ]; then
     mkdir -p "$PREFIX"
   elif command -v sudo >/dev/null 2>&1; then
     log "$PREFIX is not writable by $(id -nu); re-running under sudo"
-    exec sudo -E "$0" "$@"
+    # An explicit --preserve-env=<names> list, not -E: sudo-rs (the default sudo on Ubuntu
+    # 25.10+) silently ignores -E, which would drop WT_PREFIX and any other WT_* override the
+    # caller set for this invocation rather than carry it into the root pass.
+    exec sudo --preserve-env="$(compgen -e | paste -sd, -)" "$0" "$@"
   else
     die "$PREFIX is not writable and sudo is unavailable — pass a writable prefix, e.g. ./install.sh ~/.local/bin"
   fi
