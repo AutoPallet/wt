@@ -1,15 +1,15 @@
 #!/bin/bash
 # Regression spike: inetd-mode `sshd -i` speaking SSH over a stdio pipe (as
 # `docker exec -i ... sshd -i` would), key-auth, then ForceCommand wrapping the client's
-# command ($SSH_ORIGINAL_COMMAND). This is the same sshd stdio path `wt-ssh proxy` drives via
-# `docker exec -u0 -i <cid> wt ssh-serve <name>` — this spike's ProxyCommand is a LOCAL
+# command ($SSH_ORIGINAL_COMMAND). This is the same sshd stdio path `wt ssh proxy` drives via
+# `docker exec -u0 -i <cid> wt _ssh-serve <name>` — this spike's ProxyCommand is a LOCAL
 # `sudo sshd -i`, identical to that path minus docker.
 #
 # Runs the handshake against a throwaway system account this spike creates itself (NOT the
 # real login user, which this spike must not touch). That account is left LOCKED (a fresh
 # `useradd`'s default "!" shadow password) on purpose: the real login account is also
 # locked, and this spike proves the production auth path works anyway. It does, because
-# `UsePAM yes` (what `wt ssh-setup` generates) routes account validation through PAM and
+# `UsePAM yes` (what `wt _ssh-prepare` generates) routes account validation through PAM and
 # bypasses sshd's own locked-shadow rejection, so pubkey auth succeeds for a locked account.
 # (Under `UsePAM no`, sshd's `allowed_user()` refuses every method for a locked account:
 # "User X not allowed because account is locked" — which is exactly why the config is UsePAM yes.)
@@ -59,7 +59,7 @@ chmod 755 "$WORK/forcecmd.sh"
 
 # StrictModes no is spike-only: authorized_keys lives under a world-writable /tmp mktemp dir,
 # which default StrictModes would reject. Production satisfies default StrictModes via a 0700
-# ~/.wt-ssh, so `wt ssh-setup`'s generated config keeps StrictModes at its default.
+# /run/wt/ssh, so wt's generated config keeps StrictModes at its default.
 cat > "$WORK/sshd_config" <<EOF
 HostKey /etc/ssh/ssh_host_ed25519_key
 PasswordAuthentication no
