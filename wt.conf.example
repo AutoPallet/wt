@@ -71,7 +71,7 @@ WT_CANONICAL=/workspaces/myrepo
 # The unprivileged user a sandbox command runs as. wt needs root only to mount the clone, never
 # to run your shell.
 #
-# PIN these if wt is ever invoked as root — `wt ssh-serve` is, over `docker exec -u0`, and the
+# PIN these if wt is ever invoked as root — `wt _ssh-serve` is, over `docker exec -u0`, and the
 # defaults would then compute a target uid of 0. The uid is also what host-zfs-setup.sh
 # delegates the ZFS permissions to, and it must match on both sides of the container boundary
 # (bind mounts preserve uids, not names).
@@ -150,33 +150,32 @@ WT_CANONICAL=/workspaces/myrepo
 #WT_HOOK_ENTER='/workspaces/myrepo/tools/wt-hook enter'
 #WT_HOOK_TEARDOWN='/workspaces/myrepo/tools/wt-hook teardown'
 
-# ---- optional ssh transport (only if you use wt-ssh) --------------------------------------
-# `wt-ssh` runs on your LOCAL machine and proxies an ssh session into a sandbox over
-# `docker exec` — no listening port. Core wt never calls docker; skip this whole section if you
-# do not use it.
-#
-# Because wt-ssh runs on the host, it cannot read the container's /etc/wt/config: it looks for
-# <checkout>/.wt.conf, then <checkout>/.config/wt.conf (override with $WT_SSH_CONFIG). Keeping
-# the config in the repo is what lets one file serve both sides.
+# ---- ssh transport ------------------------------------------------------------------------
+# `wt ssh` runs on your LOCAL machine and proxies an SSH session into a sandbox over
+# `docker exec` — no listening port. The host discovers WT_CANONICAL from the checkout's Docker
+# mount and asks container-side wt to verify it, so none of this container config is duplicated
+# on the host.
 
-# Generated sshd config + authorized_keys, written by `wt ssh-setup` (inside the container).
-# Default: $HOME/.wt-ssh
-#WT_SSH_DIR=$HOME/.wt-ssh
+# Ephemeral sshd config + authorized_keys. The host-side proxy writes these before opening a
+# connection. Keep this independent of $HOME because the preparation/server helpers run as root
+# and the forced command runs as WT_TARGET_USER.
+# Default: /run/wt/ssh
+#WT_SSH_DIR=/run/wt/ssh
 
-# How the ProxyCommand lines `wt ssh-config` prints should invoke wt-ssh on your LOCAL machine.
-# A bare name is looked up on your PATH — which is where `install.sh --with-ssh` puts it. A value
-# containing a slash is taken as relative to the checkout, for projects that vendor wt-ssh in-repo
-# rather than installing it.
-# Default: wt-ssh
-#WT_SSH_PROXY=tools/wt-ssh
+# Container host key used by the ephemeral sshd.
+# Default: /etc/ssh/ssh_host_ed25519_key
+#WT_SSH_HOST_KEY=/etc/ssh/ssh_host_ed25519_key
 
-# Where wt is installed INSIDE the container (see install.sh). Used as the sshd ForceCommand and
-# by wt-ssh's `docker exec`.
+# sshd privilege-separation directory (normally ephemeral and recreated with the SSH runtime).
+# Default: /run/sshd
+#WT_SSH_PRIVSEP_DIR=/run/sshd
+
+# Where wt is installed INSIDE the container (see install.sh). Used as sshd's ForceCommand.
 # Default: /usr/local/bin/wt
 #WT_REMOTE_BIN=/usr/local/bin/wt
 
 # If your container bind-mounts the host's ssh agent, name the socket here: sessions opened over
-# wt-ssh get SSH_AUTH_SOCK pointed at it, so git/ssh out of a sandbox works. Leave it unset unless
+# wt SSH get SSH_AUTH_SOCK pointed at it, so git/ssh out of a sandbox works. Leave it unset unless
 # the socket really is there — overriding a working SSH_AUTH_SOCK with a dead path is worse than
 # doing nothing.
 # Default: empty (leave SSH_AUTH_SOCK as sshd set it).

@@ -19,10 +19,9 @@
 # installs with no privileges at all. Re-running is a no-op when everything is already in place.
 #
 # Usage:
-#   ./install.sh [PREFIX] [--copy|--symlink] [--with-ssh] [--force]
+#   ./install.sh [PREFIX] [--copy|--symlink] [--force]
 #     PREFIX        install dir (default $WT_PREFIX, else /usr/local/bin)
 #     --copy        copy the scripts instead of symlinking to this checkout
-#     --with-ssh    also install wt-ssh (the optional HOST-side docker/ssh transport)
 #     --force       replace files this installer did not put there
 #
 # Not installed: the config. `wt` finds it at $WT_CONFIG, else ~/.config/wt/config, else
@@ -40,13 +39,11 @@ SRC_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 
 PREFIX=${WT_PREFIX:-/usr/local/bin}
 mode=symlink
-with_ssh=0
 force=0
 for a in "$@"; do
   case "$a" in
     --copy)     mode=copy ;;
     --symlink)  mode=symlink ;;
-    --with-ssh) with_ssh=1 ;;
     --force)    force=1 ;;
     -h|--help)  usage; exit 0 ;;
     -*)         die "unknown option '$a' (try --help)" ;;
@@ -66,7 +63,6 @@ case "$PREFIX" in /*) ;; *) die "install prefix must be an absolute path: $PREFI
 for f in wt wt-setup.sh; do
   [ -f "$SRC_DIR/$f" ] || die "$SRC_DIR/$f is missing — run this from the wt checkout"
 done
-[ "$with_ssh" -eq 0 ] || [ -f "$SRC_DIR/wt-ssh" ] || die "$SRC_DIR/wt-ssh is missing (--with-ssh)"
 
 # Only escalate if we actually have to, and only after the arguments are known good — asking for
 # a password to then die on a typo'd flag is rude.
@@ -86,8 +82,8 @@ fi
 
 # Refuse to clobber a stranger's file. A prefix like /usr/local/bin is shared ground and `wt` is a
 # short, plausible name. The test is the same either way — does the file it resolves to look like
-# one of ours? Every one of wt/wt-setup.sh/wt-ssh mentions WT_CANONICAL and nothing else does, so
-# an older wt upgrades silently while an unrelated `wt` stops us.
+# one of ours? Both wt and wt-setup.sh mention WT_CANONICAL and unrelated commands generally do
+# not, so an older wt upgrades silently while an unrelated `wt` stops us.
 #
 # Following the symlink is the point. "It's a symlink, so we must have made it" is not an
 # argument: stow, nix-profile, asdf and friends all manage their tools as symlinks, and a bare
@@ -144,17 +140,6 @@ else
   log "wt-setup.sh: not installed — wt resolves it next to its real path ($SRC_DIR)"
 fi
 
-if [ "$with_ssh" -eq 1 ]; then
-  install_one wt-ssh
-  # wt-ssh finds the checkout it serves by asking git about its own real path, then reads the
-  # project's config from inside it. A symlink still resolves into the checkout; a COPY into
-  # $PREFIX lands it outside any repo, so it must be told.
-  if [ "$mode" = copy ]; then
-    log "note: a copied wt-ssh cannot find the checkout by itself — run it with"
-    log "      WT_SSH_REPO=<checkout> (or WT_SSH_CONFIG=<checkout>/.config/wt.conf)"
-  fi
-fi
-
 # The most common first failure is a perfectly installed wt with no config: every dataset command
 # dies on WT_CANONICAL/WT_DS_SRC/WT_DS_PARENT. Say so now rather than at first use.
 found_config=${WT_CONFIG:-}
@@ -166,9 +151,10 @@ fi
 if [ -n "$found_config" ]; then
   log "config: $found_config"
 else
-  log "config: NONE FOUND — wt needs WT_CANONICAL, WT_DS_SRC and WT_DS_PARENT."
+  log "config: NONE FOUND — container-side sandbox commands need WT_CANONICAL, WT_DS_SRC and WT_DS_PARENT."
   log "        Copy $SRC_DIR/wt.conf.example to ~/.config/wt/config (or /etc/wt/config),"
   log "        or point \$WT_CONFIG at your project's own file. Then run: wt status"
+  log "        Host-side 'wt ssh' discovers container config and does not need a local copy."
 fi
 
 case ":$PATH:" in

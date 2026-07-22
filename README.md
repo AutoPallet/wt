@@ -76,6 +76,8 @@ git clone https://github.com/AutoPallet/wt && cd wt
 sudo ./install.sh                 # /usr/local/bin, or pass a prefix
 ```
 
+See [CHANGELOG.md](CHANGELOG.md) for upgrade notes.
+
 Then write a config. `wt` reads `$WT_CONFIG` if set, else `~/.config/wt/config`, else
 `/etc/wt/config` — and the environment overrides whatever the file says. Start from
 [`wt.conf.example`](wt.conf.example):
@@ -112,30 +114,35 @@ what root mounts and what root deletes. Gate who may run `wt` at all, not what i
 
 ## Editor over SSH, with no listening port
 
-`wt-ssh` runs on your machine, not in the container, and hands your editor an SSH session
-*into* a sandbox over `docker exec`: sshd speaks its protocol over the pipe (`sshd -i`), so no
-port is bound anywhere. Two machines, three pieces:
-
-- **Inside the container, once:** `wt ssh-setup` writes an inetd-style sshd config and rebuilds
-  `authorized_keys` from your agent plus `~/.ssh/*.pub`. Run it from your container's start hook
-  (as `wt ssh-setup || true`) so it survives a container restart — and don't hand-edit the
-  generated file, the next start rewrites it.
-- **On your machine, once:** `wt-ssh config >> ~/.ssh/config` emits one `Host wt-<name>` block
-  per sandbox. Run it from inside your project's checkout — that is how wt-ssh knows which repo,
-  and so which devcontainer, it serves. Each generated block bakes in both the repo path and the
-  absolute path of the wt-ssh that generated it, so ssh itself can then run from anywhere and
-  needs nothing on PATH.
-- **Every `ssh wt-<name>`** (or a VS Code / JetBrains remote pointed at it) then flows:
-  ssh → `wt-ssh proxy` (a ProxyCommand) → `docker exec` → inetd sshd in the container →
-  `wt enter <name>`.
-
-`wt-ssh` is a standalone script and installing it is optional — putting it on PATH is a
-convenience, not a requirement:
+Run `wt ssh` on your machine (the side with Docker). It hands SSH an inetd-mode server through
+`docker exec`, so no port is bound anywhere. A direct connection needs no setup beyond installing
+`wt` on both sides:
 
 ```sh
-cd ~/code/myrepo && ~/src/wt/wt-ssh config >> ~/.ssh/config   # straight from a wt checkout
-sudo ./install.sh --with-ssh                                  # or: put `wt-ssh` on PATH
+cd ~/src/myrepo
+wt ssh connect foo
 ```
+
+For VS Code, JetBrains, or ordinary `ssh` hosts, enable the checkout once:
+
+```sh
+wt ssh enable                    # registers this host checkout and manages ~/.ssh/config
+ssh wt-myrepo.foo                # wt-<project>.<sandbox>, from any directory
+```
+
+`enable` writes one wildcard stanza for the project, not one entry per sandbox; creating or
+removing sandboxes never requires regenerating SSH config. Use `wt ssh -P myrepo ...` to select a
+registered project outside its checkout:
+
+```sh
+wt ssh -P myrepo connect foo
+wt ssh -P myrepo list
+wt ssh -P myrepo status
+wt ssh -P myrepo disable
+```
+
+Every connection recreates the container's ephemeral sshd configuration and installs a dedicated
+wt client key before opening the session.
 
 **Known limitation:** interactive sessions and remote editors work; `scp` and `sftp` do not
 ("subsystem request failed"). Every session is forced through `wt enter`, and no SFTP subsystem

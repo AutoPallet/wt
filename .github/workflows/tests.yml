@@ -15,7 +15,7 @@ jobs:
       # only surfaces at `wt enter` time — i.e. after a sandbox already exists.
       - name: syntax
         run: |
-          for f in wt wt-setup.sh wt-ssh install.sh host-zfs-setup.sh test/*.sh test/spikes/*.sh; do
+          for f in wt wt-setup.sh install.sh host-zfs-setup.sh test/*.sh test/spikes/*.sh; do
             bash -n "$f" || exit 1
           done
 
@@ -25,10 +25,10 @@ jobs:
       - name: shellcheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -x -S warning wt wt-setup.sh wt-ssh install.sh host-zfs-setup.sh
+          shellcheck -x -S warning wt wt-setup.sh install.sh host-zfs-setup.sh
 
-      # The unit suites are hermetic: zfs, git and the hooks are stubbed on PATH, docker is a
-      # shell function, and the setpriv privilege drop is disabled through its WT_DROP_PRIV seam.
+      # The unit suites are hermetic: zfs, git, docker and the hooks are stubbed on PATH, and the
+      # setpriv privilege drop is disabled through its WT_DROP_PRIV seam.
       # So they need no pool, no root and no container — which is the whole point. They gate the
       # create and destroy paths (`wt new`, `wt rm`) on a runner that has none of wt's real
       # dependencies.

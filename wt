@@ -44,17 +44,26 @@
 #   wt gc                         reclaim orphan snapshots/clones whose sandbox is gone
 #   wt status                     show config + dataset state
 #
-# SSH plumbing. You run ssh-setup once (from the container's start hook); `wt-ssh` and sshd call
-# the rest:
-#   wt ssh-setup                  write $WT_SSH_DIR sshd config + authorized_keys   <- YOU, once
-#   wt ssh-config [repo]          emit ~/.ssh/config blocks          <- `wt-ssh config`
-#   wt ssh-serve  <name>          inetd sshd entry over docker exec  <- `wt-ssh proxy <name>`
-#   wt ssh-forced                 sshd ForceCommand -> wt enter <name>
+# Host-side SSH access (run these on the machine with docker):
+#   wt ssh enable                 register this checkout for editors and ordinary ssh clients
+#   wt ssh connect <name>         connect directly; registration is not required
+#   wt ssh list                   list sandboxes through the matching container
+#   wt ssh status                 explain project, container and ssh configuration discovery
+#   wt ssh disable                remove this checkout's managed editor integration
+# Use `wt ssh -P <project> ...` outside a checkout. Editor hosts are wt-<project>.<sandbox>.
 set -euo pipefail
 
 # wt-setup.sh is wt's neighbour in the checkout. readlink -f resolves an install symlink back to
 # the real file, so SELF_DIR lands next to wt-setup.sh wherever wt itself was installed from.
 SELF_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+
+# `wt ssh` is a HOST-side command and must work without the container's WT_CONFIG. In particular,
+# a host checkout should not need to duplicate WT_CANONICAL just so we can discover the mount that
+# tells us WT_CANONICAL. Keep defining the ordinary defaults below (function bodies expect them),
+# but do not source or validate a container config for this one command family. Private `_ssh-*`
+# commands run inside the container and intentionally take the normal configured path.
+_wt_host_ssh=0
+[ "${1:-}" = ssh ] && _wt_host_ssh=1
 
 die() { echo "wt: $*" >&2; exit 1; }
 log() { echo "wt: $*" >&2; }
@@ -69,17 +78,19 @@ log() { echo "wt: $*" >&2; }
 #     /etc/wt/config
 # WT_CONFIG= (explicitly empty) skips the file entirely. The unit tests set that, so a stray
 # /etc/wt/config on the machine cannot reach in and change their answers.
-_wt_env=$(export -p | grep -E '^declare -x WT_[A-Za-z0-9_]+=' || true)
-if [ -z "${WT_CONFIG+x}" ]; then
-  for _c in "${XDG_CONFIG_HOME:-$HOME/.config}/wt/config" /etc/wt/config; do
-    [ -r "$_c" ] && { WT_CONFIG=$_c; break; }
-  done
-fi
-if [ -n "${WT_CONFIG:-}" ]; then
-  [ -r "$WT_CONFIG" ] || die "config file not readable: $WT_CONFIG"
-  # shellcheck source=/dev/null
-  . "$WT_CONFIG"
-  eval "$_wt_env"        # environment wins over the file
+if [ "$_wt_host_ssh" -eq 0 ]; then
+  _wt_env=$(export -p | grep -E '^declare -x WT_[A-Za-z0-9_]+=' || true)
+  if [ -z "${WT_CONFIG+x}" ]; then
+    for _c in "${XDG_CONFIG_HOME:-$HOME/.config}/wt/config" /etc/wt/config; do
+      [ -r "$_c" ] && { WT_CONFIG=$_c; break; }
+    done
+  fi
+  if [ -n "${WT_CONFIG:-}" ]; then
+    [ -r "$WT_CONFIG" ] || die "config file not readable: $WT_CONFIG"
+    # shellcheck source=/dev/null
+    . "$WT_CONFIG"
+    eval "$_wt_env"        # environment wins over the file
+  fi
 fi
 
 # The checkout wt clones. No sensible default — an install must declare it.
@@ -110,7 +121,7 @@ WT_ZFS_PROP=${WT_ZFS_PROP:-com.wt:managed}
 
 # uid/gid the sandbox command runs as. wt needs root only to mount the clone, never to run
 # your shell. Defaults to whoever invoked wt — but pin it in config if wt is ever invoked as
-# root (`wt ssh-serve` is), since `id -u` would then be 0.
+# root (`wt _ssh-serve` is), since `id -u` would then be 0.
 WT_TARGET_UID=${WT_TARGET_UID:-$(id -u)}
 WT_TARGET_GID=${WT_TARGET_GID:-$(id -g)}
 WT_TARGET_USER=${WT_TARGET_USER:-$(id -nu "$WT_TARGET_UID" 2>/dev/null || echo "$WT_TARGET_UID")}
@@ -126,12 +137,16 @@ WT_HOLD_DIR=${WT_HOLD_DIR:-/tmp/wt-holds}
 WT_HOOK_ENTER=${WT_HOOK_ENTER:-}
 WT_HOOK_TEARDOWN=${WT_HOOK_TEARDOWN:-}
 
-# ---- optional ssh transport (see wt-ssh) -------------------------------------------------
-WT_SSH_DIR=${WT_SSH_DIR:-$HOME/.wt-ssh}            # inetd sshd config + authorized_keys
-WT_SSH_PROXY=${WT_SSH_PROXY:-wt-ssh}               # ProxyCommand path, relative to the checkout
+# ---- ssh transport ------------------------------------------------------------------------
+# Runtime files are recreated lazily by every host-side proxy connection. This path must not
+# depend on $HOME: `_ssh-prepare` and `_ssh-serve` run as root, while `_ssh-forced` runs as the
+# target user, and docker commonly gives those users different homes.
+WT_SSH_DIR=${WT_SSH_DIR:-/run/wt/ssh}               # inetd sshd config + authorized_keys
 WT_REMOTE_BIN=${WT_REMOTE_BIN:-/usr/local/bin/wt}  # wt's path inside the container
+WT_SSH_HOST_KEY=${WT_SSH_HOST_KEY:-/etc/ssh/ssh_host_ed25519_key}
+WT_SSH_PRIVSEP_DIR=${WT_SSH_PRIVSEP_DIR:-/run/sshd}
 # If your container mounts the host's ssh agent, name its socket here and sandbox sessions
-# opened over `wt-ssh` inherit it, so git/ssh out of a sandbox works. Empty: leave SSH_AUTH_SOCK
+# opened over `wt ssh` inherit it, so git/ssh out of a sandbox works. Empty: leave SSH_AUTH_SOCK
 # to whatever sshd set up.
 WT_SSH_AGENT_SOCK=${WT_SSH_AGENT_SOCK:-}
 
@@ -704,98 +719,503 @@ wt_status() {
     || echo "active        : none"
 }
 
-wt_ssh_config() {
-  local repo="${1:-LOCAL_REPO}"   # this checkout's path on your local machine; the container can't know it
-  local caller="${2:-}"           # absolute local path of the wt-ssh generating this config, if any
-  local d name proxy
-  # The ProxyCommand target, in order: a WT_SSH_PROXY containing a slash is a project that
-  # vendors wt-ssh at a checkout-relative path — deliberate config, it wins. Otherwise the
-  # absolute path of the wt-ssh that is generating this config (passed through by its `config`
-  # verb) is known-good on the local machine whether or not it is on PATH. A bare PATH-looked-up
-  # name is the last resort, for hand-run `wt ssh-config`.
-  case "$WT_SSH_PROXY" in
-    */*) proxy="$repo/$WT_SSH_PROXY" ;;
-    *)   proxy="${caller:-$WT_SSH_PROXY}" ;;
+# ---- container-side ssh helpers -----------------------------------------------------------
+# These are private commands invoked through docker exec or by sshd. They deliberately retain
+# the ordinary container config path; unlike the public `wt ssh` family, they know WT_CANONICAL.
+wt_ssh_info() {
+  local config=${WT_CONFIG:-}
+  [ -n "$WT_CANONICAL" ] || die "WT_CANONICAL is not set in the container"
+  [ -n "$config" ] || config=-
+  case "$WT_CANONICAL$WT_TARGET_USER$WT_TARGET_UID$WT_TARGET_GID$WT_HOME$config" in
+    *$'\t'*|*$'\n'*) die "tabs/newlines are not valid in SSH identity fields" ;;
   esac
-  echo "# --- wt-ssh: paste into ~/.ssh/config on your local machine ---"
-  [ "$repo" = LOCAL_REPO ] && \
-    echo "# Replace LOCAL_REPO with this checkout's path on your local machine (the source of $WT_CANONICAL)."
-  # WT_SSH_REPO is baked into every ProxyCommand: ssh runs it from an arbitrary directory (an
-  # editor typically spawns it from $HOME), where wt-ssh could not otherwise tell which checkout
-  # — and so which container — the session is for.
-  for d in "$WT_HOME"/trees/*/; do
-    [ -d "$d" ] || continue
-    name=$(basename "$d")
-    printf '\nHost wt-%s\n  User %s\n  ProxyCommand env WT_SSH_REPO=%s %s proxy %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' \
-      "$name" "$WT_TARGET_USER" "$repo" "$proxy" "$name"
-  done
+  printf 'wt:ssh-info\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${WT_CANONICAL%/}" "$WT_TARGET_USER" "$WT_TARGET_UID" "$WT_TARGET_GID" "$WT_HOME" "$config"
 }
 
-wt_ssh_setup() {
-  mkdir -p "$WT_SSH_DIR"; chmod 700 "$WT_SSH_DIR"
-  sudo mkdir -p /run/sshd && sudo chmod 0755 /run/sshd   # sshd privsep dir (lost on container restart)
+# Root receives wt's dedicated public key on stdin and rewrites the runtime files atomically.
+wt_ssh_prepare() {
+  [ "$(id -u)" -eq 0 ] || die "_ssh-prepare must run as root"
+  local public_key sshd keys_tmp config_tmp
+  IFS= read -r public_key || die "_ssh-prepare expected a public key on stdin"
+  case "$public_key" in
+    ssh-*' '*|ecdsa-*' '*|sk-*' '*) ;;
+    *) die "_ssh-prepare received an invalid public key" ;;
+  esac
+  sshd=$(command -v sshd 2>/dev/null || true)
+  [ -n "$sshd" ] || die "sshd not found in the container (install openssh-server)"
+  [ -r "$WT_SSH_HOST_KEY" ] \
+    || die "missing $WT_SSH_HOST_KEY (install openssh-server or generate host keys)"
+  id "$WT_TARGET_USER" >/dev/null 2>&1 || die "target user does not exist: $WT_TARGET_USER"
 
-  cat > "$WT_SSH_DIR/sshd_config" <<EOF
-# Generated by 'wt ssh-setup'. Inetd-mode config for wt-ssh (see wt ssh-serve).
-HostKey /etc/ssh/ssh_host_ed25519_key
+  mkdir -p "$WT_SSH_PRIVSEP_DIR" "$WT_SSH_DIR"
+  chmod 0755 "$WT_SSH_PRIVSEP_DIR" "$WT_SSH_DIR"
+
+  keys_tmp=$(mktemp "$WT_SSH_DIR/.authorized_keys.XXXXXX")
+  printf '%s\n' "$public_key" > "$keys_tmp"
+  chmod 0600 "$keys_tmp"
+  mv -f -- "$keys_tmp" "$WT_SSH_DIR/authorized_keys"
+  chown "$WT_TARGET_UID:$WT_TARGET_GID" "$WT_SSH_DIR/authorized_keys"
+
+  config_tmp=$(mktemp "$WT_SSH_DIR/.sshd_config.XXXXXX")
+  cat > "$config_tmp" <<EOF
+# Generated lazily by wt. Inetd-mode sshd reached only through docker exec.
+HostKey $WT_SSH_HOST_KEY
 UsePAM yes
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 AllowUsers $WT_TARGET_USER
 AuthorizedKeysFile $WT_SSH_DIR/authorized_keys
-ForceCommand $WT_REMOTE_BIN ssh-forced
+ForceCommand $WT_REMOTE_BIN _ssh-forced
 PermitTTY yes
+AllowAgentForwarding yes
 LogLevel INFO
 EOF
-
-  # Authorize the forwarded agent key(s) plus any local pubkeys. This grants no new access: you
-  # already need docker to reach the container at all, which is strictly more power.
-  #
-  # Staged, and moved into place only once it holds a key. A container start that beats the host's
-  # agent forwarding finds `ssh-add -L` empty — and if that overwrote authorized_keys in place, it
-  # would lock wt-ssh out. Typically run as `wt ssh-setup || true` from a container start hook,
-  # where the swallowed exit code would be the only trace.
-  local keys="$WT_SSH_DIR/authorized_keys.new"
-  { ssh-add -L 2>/dev/null; cat "$HOME"/.ssh/*.pub 2>/dev/null; } \
-    | grep -E '^(ssh-|ecdsa-|sk-)' | sort -u > "$keys" || true
-  if [ ! -s "$keys" ]; then
-    rm -f "$keys"
-    die "no public keys found (agent empty and no $HOME/.ssh/*.pub) — add a key and re-run"
-  fi
-  # Header first, so the file doesn't read as hand-maintained: it is rebuilt on every container
-  # start, and a key appended here by hand silently vanishes on the next one.
-  printf '%s\n%s\n' \
-    "# Generated by 'wt ssh-setup' — rebuilt on container start; add persistent keys as ~/.ssh/*.pub" \
-    "$(cat "$keys")" > "$keys"
-  chmod 600 "$keys"
-  mv -f "$keys" "$WT_SSH_DIR/authorized_keys"
-
-  sudo /usr/sbin/sshd -t -f "$WT_SSH_DIR/sshd_config" \
-    || die "generated sshd_config failed 'sshd -t' validation"
-
-  log "wt-ssh ready: $(grep -cE '^(ssh-|ecdsa-|sk-)' "$WT_SSH_DIR/authorized_keys") key(s) authorized in $WT_SSH_DIR"
-  log "on your local machine: run 'wt-ssh config' from the checkout and paste it into ~/.ssh/config"
+  chmod 0600 "$config_tmp"
+  "$sshd" -t -f "$config_tmp" || { rm -f -- "$config_tmp"; die "generated sshd_config failed validation"; }
+  mv -f -- "$config_tmp" "$WT_SSH_DIR/sshd_config"
 }
 
-# Runs as ROOT (over `docker exec -u0`): inetd sshd needs real privileges to read the host key,
-# do privsep, and setuid to the target user. The sandbox name rides in on -o SetEnv, where the
-# ForceCommand below picks it up. Validated here so a bad name fails cleanly, before sshd starts.
+# Runs as root: inetd sshd needs privileges for its host key, privsep and setuid. The sandbox name
+# is validated before sshd starts, then carried to the forced command through a server-side SetEnv.
 wt_ssh_serve() {
-  local name=${1:?usage: wt ssh-serve <name>}; validate_name "$name"; set_paths "$name"
+  [ "$(id -u)" -eq 0 ] || die "_ssh-serve must run as root"
+  local name=${1:?usage: wt _ssh-serve <name>} sshd
+  validate_name "$name"; set_paths "$name"
   [ -d "$tree" ] || die "no sandbox '$name' — run 'wt new $name'"
-  exec /usr/sbin/sshd -i -e -o "SetEnv=WT_SANDBOX=$name" -f "$WT_SSH_DIR/sshd_config"
+  [ -r "$WT_SSH_DIR/sshd_config" ] || die "SSH runtime is not prepared"
+  sshd=$(command -v sshd 2>/dev/null || true)
+  [ -n "$sshd" ] || die "sshd not found in the container"
+  exec "$sshd" -i -e -o "SetEnv=WT_SANDBOX=$name" -f "$WT_SSH_DIR/sshd_config"
 }
 
-# sshd ForceCommand target — runs as the target user, post-auth. Enters the sandbox and runs the
-# client's command (SSH hands it over as one string) under a login shell, preserving quoting.
+# sshd has authenticated and changed to WT_TARGET_USER before invoking this forced command.
 wt_ssh_forced() {
-  : "${WT_SANDBOX:?WT_SANDBOX unset (wt ssh-serve must pass -o SetEnv=WT_SANDBOX)}"
+  : "${WT_SANDBOX:?WT_SANDBOX unset (wt _ssh-serve must set it)}"
   validate_name "$WT_SANDBOX"
-  # Only if the install declared one. Pointing SSH_AUTH_SOCK at a socket that isn't there is worse
-  # than leaving it alone: it would override a working agent with a dead path.
   [ -n "$WT_SSH_AGENT_SOCK" ] && export SSH_AUTH_SOCK="$WT_SSH_AGENT_SOCK"
   wt_enter "$WT_SANDBOX" -- bash -lc "${SSH_ORIGINAL_COMMAND:-exec bash -l}"
+}
+
+# ---- host-side `wt ssh` ------------------------------------------------------------------
+wt_host_ssh_paths() {
+  SSH_CONFIG_ROOT=${WT_SSH_CONFIG_ROOT:-${XDG_CONFIG_HOME:-$HOME/.config}/wt}
+  SSH_PROJECTS_DIR=${WT_SSH_PROJECTS_DIR:-$SSH_CONFIG_ROOT/projects}
+  SSH_GENERATED_CONFIG=${WT_SSH_GENERATED_CONFIG:-$SSH_CONFIG_ROOT/ssh_config}
+  SSH_USER_CONFIG=${WT_SSH_USER_CONFIG:-$HOME/.ssh/config}
+  SSH_KEY=${WT_SSH_KEY:-${XDG_DATA_HOME:-$HOME/.local/share}/wt/ssh/id_ed25519}
+  SSH_REMOTE_BIN=${WT_SSH_REMOTE_BIN:-wt}
+  if [ -n "${WT_SSH_BIN:-}" ]; then
+    SSH_SELF=$WT_SSH_BIN
+  elif [[ "$0" = */* ]]; then
+    SSH_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  else
+    SSH_SELF=$(command -v "$0" 2>/dev/null || command -v wt 2>/dev/null || echo "$0")
+  fi
+}
+
+wt_host_validate_project() {
+  case "${1:-}" in
+    ''|-*|*[!a-zA-Z0-9_-]*) die "invalid project name: '${1:-}'" ;;
+  esac
+}
+
+wt_host_current_repo() {
+  local repo
+  repo=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) \
+    || die "not in a git checkout; run from the project checkout or use 'wt ssh -P PROJECT ...'"
+  case "$repo" in *$'\n'*|*$'\t'*) die "tabs/newlines in checkout paths are not supported" ;; esac
+  realpath -m "$repo"
+}
+
+wt_host_derive_project() {
+  local name
+  name=$(basename "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^-+//; s/-+$//')
+  [ -n "$name" ] || die "cannot derive a project name from '$1'; pass -P PROJECT"
+  printf '%s\n' "$name"
+}
+
+wt_host_registry_repo() {
+  local project=$1 file="$SSH_PROJECTS_DIR/$1/repo"
+  wt_host_validate_project "$project"
+  [ -r "$file" ] || die "project '$project' is not registered; run 'wt ssh -P $project enable' from its checkout"
+  IFS= read -r SSH_REPO < "$file" || die "empty project registration: $file"
+  [ -n "$SSH_REPO" ] || die "empty project registration: $file"
+  SSH_REPO=$(realpath -m "$SSH_REPO")
+}
+
+wt_host_registered_project_for_repo() {
+  local wanted entry repo
+  wanted=$(realpath -m "$1")
+  SSH_PROJECT=
+  for entry in "$SSH_PROJECTS_DIR"/*; do
+    [ -r "$entry/repo" ] || continue
+    IFS= read -r repo < "$entry/repo" || continue
+    [ "$(realpath -m "$repo")" = "$wanted" ] || continue
+    SSH_PROJECT=$(basename "$entry")
+    return 0
+  done
+  return 1
+}
+
+# Set SSH_REPO and, when registered, SSH_PROJECT. An explicit -P always means registry lookup;
+# without one the current checkout is enough for connect/list/status and registration is optional.
+wt_host_project_context() {
+  local requested=${1:-}
+  if [ -n "$requested" ]; then
+    SSH_PROJECT=$requested
+    wt_host_registry_repo "$requested"
+  else
+    SSH_REPO=$(wt_host_current_repo)
+    wt_host_registered_project_for_repo "$SSH_REPO" || SSH_PROJECT=
+  fi
+}
+
+# Parse the fixed, tab-delimited record from container-side `_ssh-info`. Empty WT_CONFIG is encoded
+# as "-" so shell IFS handling cannot collapse a field. The resolved identity and WT_HOME are
+# carried into root docker execs; otherwise defaults would change with uid/HOME between discovery
+# and preparation.
+wt_host_parse_info() {
+  local info=$1 marker extra
+  case "$info" in *$'\n'*) return 1 ;; esac
+  IFS=$'\t' read -r marker INFO_CANONICAL INFO_USER INFO_UID INFO_GID INFO_HOME INFO_CONFIG extra <<< "$info"
+  [ "$marker" = 'wt:ssh-info' ] && [ -n "$INFO_CANONICAL" ] && [ -n "$INFO_USER" ] \
+    && [ -n "$INFO_UID" ] && [ -n "$INFO_GID" ] && [ -n "$INFO_HOME" ] && [ -z "$extra" ] \
+    || return 1
+  case "$INFO_UID$INFO_GID" in *[!0-9]*) return 1 ;; esac
+  [ "$INFO_CONFIG" != - ] || INFO_CONFIG=
+}
+
+# Resolve a checkout to the running container whose bind mount source is that checkout and whose
+# destination agrees with container-side WT_CANONICAL. Results include the resolved target
+# identity/config needed to make later root helpers see the same project state.
+wt_host_resolve_container() {
+  local repo=$1 c mounts src dst info saw_mount=0 detail='' override_match=0
+  local -a cids=() canonicals=() users=() uids=() gids=() homes=() configs=()
+  SSH_CID='' SSH_CANONICAL='' SSH_TARGET_USER='' SSH_TARGET_UID='' SSH_TARGET_GID=''
+  SSH_CONTAINER_HOME='' SSH_CONTAINER_CONFIG='' SSH_RESOLVE_ERROR=''
+  command -v docker >/dev/null 2>&1 \
+    || { SSH_RESOLVE_ERROR="docker is not installed or not on PATH"; return 1; }
+
+  if [ -n "${WT_SSH_CONTAINER:-}" ]; then
+    c=$WT_SSH_CONTAINER
+    mounts=$(docker inspect "$c" --format '{{range .Mounts}}{{printf "%s\t%s\n" .Source .Destination}}{{end}}' 2>/dev/null) \
+      || { SSH_RESOLVE_ERROR="cannot inspect container $c"; return 1; }
+    info=$(docker exec "$c" "$SSH_REMOTE_BIN" _ssh-info 2>/dev/null) \
+      || { SSH_RESOLVE_ERROR="cannot query wt in container $c"; return 1; }
+    wt_host_parse_info "$info" \
+      || { SSH_RESOLVE_ERROR="container $c returned invalid wt SSH info"; return 1; }
+    while IFS=$'\t' read -r src dst; do
+      [ -n "$src" ] && [ -n "$dst" ] || continue
+      [ "$(realpath -m "${src%/}")" = "$(realpath -m "${repo%/}")" ] || continue
+      saw_mount=1
+      if [ "${INFO_CANONICAL%/}" = "${dst%/}" ]; then override_match=1; break; fi
+      detail="container $c mounts the checkout at $dst, but its WT_CANONICAL is $INFO_CANONICAL"
+    done <<< "$mounts"
+    if [ "$override_match" -eq 0 ]; then
+      SSH_RESOLVE_ERROR=${detail:-"container $c does not mount $repo"}
+      return 1
+    fi
+    SSH_CID=$c; SSH_CANONICAL=$INFO_CANONICAL; SSH_TARGET_USER=$INFO_USER
+    SSH_TARGET_UID=$INFO_UID; SSH_TARGET_GID=$INFO_GID; SSH_CONTAINER_HOME=$INFO_HOME
+    SSH_CONTAINER_CONFIG=$INFO_CONFIG
+    return 0
+  fi
+
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    mounts=$(docker inspect "$c" --format '{{range .Mounts}}{{printf "%s\t%s\n" .Source .Destination}}{{end}}' 2>/dev/null) || continue
+    while IFS=$'\t' read -r src dst; do
+      [ -n "$src" ] && [ -n "$dst" ] || continue
+      [ "$(realpath -m "${src%/}")" = "$(realpath -m "${repo%/}")" ] || continue
+      saw_mount=1
+      info=$(docker exec "$c" "$SSH_REMOTE_BIN" _ssh-info 2>/dev/null) \
+        || { detail="container $c mounts the checkout, but '$SSH_REMOTE_BIN _ssh-info' failed; install wt in the container and check its config"; continue; }
+      if ! wt_host_parse_info "$info"; then
+        detail="container $c returned invalid output from '$SSH_REMOTE_BIN _ssh-info'"
+        continue
+      fi
+      if [ "${INFO_CANONICAL%/}" != "${dst%/}" ]; then
+        detail="container $c mounts the checkout at $dst, but its WT_CANONICAL is $INFO_CANONICAL"
+        continue
+      fi
+      cids+=("$c"); canonicals+=("$INFO_CANONICAL"); users+=("$INFO_USER")
+      uids+=("$INFO_UID"); gids+=("$INFO_GID"); homes+=("$INFO_HOME"); configs+=("$INFO_CONFIG")
+    done <<< "$mounts"
+  done < <(docker ps -q 2>/dev/null)
+
+  case ${#cids[@]} in
+    0) if [ "$saw_mount" -eq 1 ] && [ -n "$detail" ]; then SSH_RESOLVE_ERROR=$detail
+       else SSH_RESOLVE_ERROR="no running container mounts $repo as its configured WT_CANONICAL"; fi
+       return 1 ;;
+    1) SSH_CID=${cids[0]}; SSH_CANONICAL=${canonicals[0]}; SSH_TARGET_USER=${users[0]}
+       SSH_TARGET_UID=${uids[0]}; SSH_TARGET_GID=${gids[0]}; SSH_CONTAINER_HOME=${homes[0]}
+       SSH_CONTAINER_CONFIG=${configs[0]}; return 0 ;;
+    *) SSH_RESOLVE_ERROR="multiple running containers match $repo (${cids[*]}); set WT_SSH_CONTAINER to choose one"; return 1 ;;
+  esac
+}
+
+wt_host_ensure_key() {
+  local dir=${SSH_KEY%/*} key_lock
+  command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required for wt SSH access"
+  mkdir -p "$dir"; chmod 0700 "$dir"
+  exec {key_lock}>"$dir/.key.lock"
+  flock -w 10 "$key_lock" || die "timed out waiting for another wt process to create the SSH key"
+  if [ ! -s "$SSH_KEY" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C 'wt managed SSH key' -f "$SSH_KEY" \
+      || die "could not create SSH key: $SSH_KEY"
+  fi
+  chmod 0600 "$SSH_KEY"
+  if [ ! -s "$SSH_KEY.pub" ]; then
+    ssh-keygen -y -f "$SSH_KEY" > "$SSH_KEY.pub"
+  fi
+  chmod 0644 "$SSH_KEY.pub"
+  flock -u "$key_lock"
+  exec {key_lock}>&-
+}
+
+wt_host_shell_quote() {
+  local value=$1
+  case "$value" in *$'\n'*|*$'\r'*) die "newlines are not supported in the wt executable path" ;; esac
+  printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+wt_host_emit_config() {
+  local only=${1:-} entry project user bin key=${SSH_KEY//\\/\\\\}
+  # OpenSSH expands percent tokens before handing ProxyCommand to the shell; %% is a literal %.
+  bin=$(wt_host_shell_quote "${SSH_SELF//%/%%}")
+  key=${key//\"/\\\"}
+  echo "# Generated by 'wt ssh enable'. Changes will be overwritten."
+  for entry in "$SSH_PROJECTS_DIR"/*; do
+    [ -r "$entry/repo" ] && [ -r "$entry/user" ] || continue
+    project=$(basename "$entry"); wt_host_validate_project "$project"
+    [ -z "$only" ] || [ "$project" = "$only" ] || continue
+    IFS= read -r user < "$entry/user" || die "empty target user in $entry/user"
+    case "$user" in ''|*[!a-zA-Z0-9_.-]*) die "invalid target user in $entry/user: '$user'" ;; esac
+    printf '\nHost wt-%s.*\n' "$project"
+    printf '    User %s\n' "$user"
+    printf '    IdentityFile "%s"\n' "$key"
+    printf '    IdentitiesOnly yes\n'
+    printf '    ProxyCommand %s ssh -P %s proxy %%n\n' "$bin" "$project"
+    printf '    StrictHostKeyChecking no\n'
+    printf '    UserKnownHostsFile /dev/null\n'
+  done
+}
+
+wt_host_write_generated_config() {
+  local dir=${SSH_GENERATED_CONFIG%/*} tmp
+  mkdir -p "$dir"; chmod 0700 "$dir"
+  tmp=$(mktemp "$dir/.ssh_config.XXXXXX")
+  wt_host_emit_config > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$SSH_GENERATED_CONFIG"
+}
+
+wt_host_preflight_user_config() {
+  local begin='# BEGIN wt managed SSH config' end='# END wt managed SSH config' begins=0 ends=0
+  [ ! -L "$SSH_USER_CONFIG" ] \
+    || die "$SSH_USER_CONFIG is a symlink; add the generated config with an Include yourself"
+  if [ -e "$SSH_USER_CONFIG" ]; then
+    [ -f "$SSH_USER_CONFIG" ] && [ -r "$SSH_USER_CONFIG" ] \
+      || die "SSH config is not a readable regular file: $SSH_USER_CONFIG"
+    begins=$(grep -Fxc "$begin" "$SSH_USER_CONFIG" || true)
+    ends=$(grep -Fxc "$end" "$SSH_USER_CONFIG" || true)
+    [ "$begins" -eq "$ends" ] && [ "$begins" -le 1 ] \
+      || die "managed wt markers are unbalanced in $SSH_USER_CONFIG; repair them before retrying"
+  fi
+}
+
+wt_host_install_include() {
+  local dir=${SSH_USER_CONFIG%/*} tmp begin='# BEGIN wt managed SSH config' end='# END wt managed SSH config'
+  local include_path=${SSH_GENERATED_CONFIG//\\/\\\\}
+  include_path=${include_path//\"/\\\"}
+  local include="Include \"$include_path\""
+  wt_host_preflight_user_config
+  mkdir -p "$dir"; chmod 0700 "$dir"
+  tmp=$(mktemp "$dir/.config.XXXXXX")
+  printf '%s\n%s\n%s\n\n' "$begin" "$include" "$end" > "$tmp"
+  if [ -r "$SSH_USER_CONFIG" ]; then
+    awk -v begin="$begin" -v end="$end" -v include_line="$include" '
+      $0 == begin { skip=1; next }
+      $0 == end && skip { skip=0; next }
+      !skip && $0 != include_line { print }
+    ' "$SSH_USER_CONFIG" >> "$tmp"
+  fi
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$SSH_USER_CONFIG"
+}
+
+wt_host_ssh_enable() {
+  local requested=${1:-} repo project entry existing tmp registered=
+  repo=$(wt_host_current_repo)
+  if wt_host_registered_project_for_repo "$repo"; then registered=$SSH_PROJECT; fi
+  if [ -n "$requested" ]; then
+    [ -z "$registered" ] || [ "$registered" = "$requested" ] \
+      || die "this checkout is already registered as '$registered'; disable it before renaming it to '$requested'"
+    project=$requested
+  else
+    project=${registered:-$(wt_host_derive_project "$repo")}
+  fi
+  wt_host_validate_project "$project"
+  entry="$SSH_PROJECTS_DIR/$project"
+  if [ -r "$entry/repo" ]; then
+    IFS= read -r existing < "$entry/repo" || true
+    [ "$(realpath -m "${existing:-/nonexistent}")" = "$repo" ] \
+      || die "project '$project' is already registered to ${existing:-an invalid path}; choose another with -P"
+  fi
+  wt_host_preflight_user_config
+  wt_host_resolve_container "$repo" || die "$SSH_RESOLVE_ERROR"
+  wt_host_ensure_key
+  mkdir -p "$entry"; chmod 0700 "$SSH_PROJECTS_DIR" "$entry"
+  tmp=$(mktemp "$entry/.repo.XXXXXX"); printf '%s\n' "$repo" > "$tmp"; chmod 0600 "$tmp"; mv -f -- "$tmp" "$entry/repo"
+  tmp=$(mktemp "$entry/.user.XXXXXX"); printf '%s\n' "$SSH_TARGET_USER" > "$tmp"; chmod 0600 "$tmp"; mv -f -- "$tmp" "$entry/user"
+  wt_host_write_generated_config
+  wt_host_install_include
+  log "SSH enabled for project '$project'"
+  log "editor host pattern: wt-$project.<sandbox> (for example: ssh wt-$project.foo)"
+  log "managed config: $SSH_GENERATED_CONFIG"
+}
+
+wt_host_ssh_disable() {
+  local requested=${1:-} repo project entry
+  if [ -n "$requested" ]; then
+    project=$requested; wt_host_validate_project "$project"
+  else
+    repo=$(wt_host_current_repo)
+    wt_host_registered_project_for_repo "$repo" \
+      || die "this checkout is not SSH-enabled; select one with 'wt ssh -P PROJECT disable'"
+    project=$SSH_PROJECT
+  fi
+  entry="$SSH_PROJECTS_DIR/$project"
+  [ -d "$entry" ] || die "project '$project' is not registered"
+  rm -rf -- "$entry"
+  wt_host_write_generated_config
+  log "SSH disabled for project '$project' (the shared wt SSH key was kept)"
+}
+
+wt_host_ssh_proxy() {
+  local project=${1:-}; shift || true
+  local repo='' tree='' host='' expected
+  if [ -n "$project" ]; then
+    wt_host_registry_repo "$project"; repo=$SSH_REPO
+    host=${1:-}; [ -n "$host" ] || die "internal SSH proxy is missing its host alias"
+    expected="wt-$project."
+    case "$host" in "$expected"*) tree=${host#"$expected"} ;; *) die "host '$host' does not match project '$project' ($expected<sandbox>)" ;; esac
+  else
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --repo) [ $# -ge 2 ] || die "proxy: --repo needs a path"; repo=$2; shift 2 ;;
+        --tree) [ $# -ge 2 ] || die "proxy: --tree needs a name"; tree=$2; shift 2 ;;
+        *) die "proxy: unexpected argument '$1'" ;;
+      esac
+    done
+  fi
+  [ -n "$repo" ] && [ -n "$tree" ] || die "internal SSH proxy is missing a repo or sandbox"
+  validate_name "$tree"
+  wt_host_resolve_container "$repo" || die "$SSH_RESOLVE_ERROR"
+  wt_host_ensure_key
+  local -a root_exec=(docker exec -u0
+    -e "WT_CONFIG=$SSH_CONTAINER_CONFIG" -e "WT_CANONICAL=$SSH_CANONICAL"
+    -e "WT_HOME=$SSH_CONTAINER_HOME" -e "WT_TARGET_USER=$SSH_TARGET_USER"
+    -e "WT_TARGET_UID=$SSH_TARGET_UID" -e "WT_TARGET_GID=$SSH_TARGET_GID")
+  "${root_exec[@]}" -i "$SSH_CID" "$SSH_REMOTE_BIN" _ssh-prepare < "$SSH_KEY.pub" \
+    || die "could not prepare SSH in container $SSH_CID"
+  exec "${root_exec[@]}" -i "$SSH_CID" "$SSH_REMOTE_BIN" _ssh-serve "$tree"
+}
+
+wt_host_ssh_connect() {
+  local requested=$1; shift
+  local tree=${1:-}; [ -n "$tree" ] || die "usage: wt ssh [-P PROJECT] connect <sandbox> [-- command...]"
+  shift; [ "${1:-}" != -- ] || shift
+  validate_name "$tree"
+  wt_host_project_context "$requested"
+  wt_host_resolve_container "$SSH_REPO" || die "$SSH_RESOLVE_ERROR"
+  wt_host_ensure_key
+
+  local label alias proxy_cmd
+  label=${SSH_PROJECT:-$(wt_host_derive_project "$SSH_REPO")}
+  alias="wt-$label.$tree"
+  local -a proxy=("${SSH_SELF//%/%%}" ssh)
+  if [ -n "$SSH_PROJECT" ]; then
+    proxy+=(-P "$SSH_PROJECT" proxy "$alias")
+  else
+    proxy+=(proxy --repo "$SSH_REPO" --tree "$tree")
+  fi
+  printf -v proxy_cmd '%q ' "${proxy[@]}"; proxy_cmd=${proxy_cmd% }
+  local -a cmd=(ssh -o "ProxyCommand=$proxy_cmd" -o "IdentityFile=$SSH_KEY" -o IdentitiesOnly=yes
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -l "$SSH_TARGET_USER" "$alias")
+  [ $# -eq 0 ] || cmd+=("$@")
+  if [ -n "${WT_SSH_DRYRUN:-}" ]; then printf '%q ' "${cmd[@]}"; printf '\n'; return 0; fi
+  exec "${cmd[@]}"
+}
+
+wt_host_ssh_list() {
+  local requested=$1
+  wt_host_project_context "$requested"
+  wt_host_resolve_container "$SSH_REPO" || die "$SSH_RESOLVE_ERROR"
+  exec docker exec -u "$SSH_TARGET_USER" "$SSH_CID" "$SSH_REMOTE_BIN" list
+}
+
+wt_host_ssh_status() {
+  local requested=$1 registered=no
+  wt_host_project_context "$requested"
+  [ -n "$SSH_PROJECT" ] && registered=yes
+  echo "project       : ${SSH_PROJECT:-UNREGISTERED}"
+  echo "checkout      : $SSH_REPO"
+  echo "registered    : $registered"
+  echo "ssh config    : $SSH_GENERATED_CONFIG"
+  echo "ssh key       : $SSH_KEY"
+  if wt_host_resolve_container "$SSH_REPO"; then
+    echo "container     : $SSH_CID"
+    echo "canonical     : $SSH_CANONICAL"
+    echo "target user   : $SSH_TARGET_USER"
+  else
+    echo "container     : NOT FOUND"
+    echo "problem       : $SSH_RESOLVE_ERROR"
+    return 1
+  fi
+}
+
+wt_host_ssh_usage() {
+  cat >&2 <<'EOF'
+usage: wt ssh [-P PROJECT|--project PROJECT] <command>
+  enable                         register this checkout and manage its editor SSH config
+  connect <sandbox> [-- cmd...]  connect directly (registration is not required in a checkout)
+  list                           list sandboxes through the project's container
+  status                         show project, container and SSH discovery
+  disable                        remove the project's managed editor integration
+  config --print                 print managed SSH config (advanced/manual installs)
+Run from the host checkout, or select a registered project with -P/--project.
+EOF
+}
+
+wt_host_ssh() {
+  wt_host_ssh_paths
+  local project='' sub
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -P|--project) [ $# -ge 2 ] || die "$1 needs a project name"; project=$2; shift 2 ;;
+      --project=*) project=${1#*=}; shift ;;
+      -h|--help) wt_host_ssh_usage; return 0 ;;
+      *) break ;;
+    esac
+  done
+  [ -z "$project" ] || wt_host_validate_project "$project"
+  sub=${1:-}; shift || true
+  case "$sub" in
+    enable)  [ $# -eq 0 ] || die "enable takes no arguments"; wt_host_ssh_enable "$project" ;;
+    connect) wt_host_ssh_connect "$project" "$@" ;;
+    list)    [ $# -eq 0 ] || die "list takes no arguments"; wt_host_ssh_list "$project" ;;
+    status)  [ $# -eq 0 ] || die "status takes no arguments"; wt_host_ssh_status "$project" ;;
+    disable) [ $# -eq 0 ] || die "disable takes no arguments"; wt_host_ssh_disable "$project" ;;
+    config)  [ "${1:-}" = --print ] && [ $# -eq 1 ] || die "usage: wt ssh [-P PROJECT] config --print"
+             [ -z "$project" ] || wt_host_registry_repo "$project"
+             wt_host_emit_config "$project" ;;
+    proxy)   wt_host_ssh_proxy "$project" "$@" ;;
+    ''|help) wt_host_ssh_usage ;;
+    *) die "unknown ssh command '$sub' (try 'wt ssh --help')" ;;
+  esac
 }
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; }
@@ -805,16 +1225,17 @@ usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOU
 
 subcmd=${1:-}; shift || true
 case "$subcmd" in
+  ssh)       wt_host_ssh "$@" ;;
   new)       wt_new "$@" ;;
   enter)     wt_enter "$@" ;;
   list)      wt_list "$@" ;;
   rm)        wt_rm "$@" ;;
   gc)        wt_gc "$@" ;;
   status)    wt_status "$@" ;;
-  ssh-config) wt_ssh_config "$@" ;;
-  ssh-setup)  wt_ssh_setup "$@" ;;
-  ssh-serve)  wt_ssh_serve "$@" ;;
-  ssh-forced) wt_ssh_forced "$@" ;;
+  _ssh-info)    wt_ssh_info "$@" ;;
+  _ssh-prepare) wt_ssh_prepare "$@" ;;
+  _ssh-serve)   wt_ssh_serve "$@" ;;
+  _ssh-forced)  wt_ssh_forced "$@" ;;
   ''|help|-h|--help) usage ;;
   *) die "unknown command '$subcmd' (try 'wt help')" ;;
 esac
